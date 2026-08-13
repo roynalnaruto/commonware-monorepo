@@ -26,6 +26,7 @@ members = [
     "stream",
     "invariants",
     "utils",
+    "examples/blob",
     "examples/bridge",
     "examples/chat",
     "examples/estimator",

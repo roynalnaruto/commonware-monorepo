@@ -1210,6 +1210,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "commonware-blob"
+version = "2026.7.0"
+dependencies = [
+ "clap",
+ "commonware-codec",
+ "commonware-coding",
+ "commonware-cryptography",
+ "commonware-parallel",
+ "commonware-utils",
+ "rand 0.10.2",
+ "rand_chacha 0.10.0",
+]
+
+[[package]]
 name = "commonware-bridge"
 version = "2026.7.0"
 dependencies = [

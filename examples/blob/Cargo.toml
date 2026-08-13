@@ -1,0 +1,28 @@
+[package]
+name = "commonware-blob"
+edition.workspace = true
+publish = false
+version.workspace = true
+license.workspace = true
+description = "Post blobs to a ZODA-backed data-availability rail alongside a consensus chain."
+homepage.workspace = true
+repository = "https://github.com/commonwarexyz/monorepo/tree/main/examples/blob"
+
+[lints]
+workspace = true
+
+[dependencies]
+clap.workspace = true
+commonware-codec = { workspace = true, features = ["std"] }
+commonware-coding.workspace = true
+commonware-cryptography = { workspace = true, features = ["std"] }
+commonware-parallel = { workspace = true, features = ["std"] }
+commonware-utils = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+rand = { workspace = true, features = ["std_rng", "alloc"] }
+rand_chacha.workspace = true
+
+[[bin]]
+name = "commonware-blob"
+bench = false
