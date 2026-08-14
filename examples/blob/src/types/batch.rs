@@ -136,11 +136,19 @@ impl BatchBuilder {
         }
     }
 
-    /// Accepts a blob, returning its identity.
+    /// Accepts a blob under the identity the caller computed for it.
     ///
     /// Rejects a blob that would breach a wire bound, and rejects a duplicate: two equal
     /// identities in one batch would make the index map ambiguous.
-    pub fn push(&mut self, blob: Blob) -> Result<BlobId, Error> {
+    ///
+    /// # Contract
+    ///
+    /// `id` must be [`Blob::id`] of `blob`. It is taken rather than derived because hashing a
+    /// blob is the expensive part of accepting one, and the gateway does it off its actor loop
+    /// before the blob ever arrives here. Nothing in this type re-derives it, so a caller that
+    /// passes an unrelated identity gets a batch whose tree does not describe its contents; every
+    /// reader recomputes both from the decoded bytes and would reject it.
+    pub fn push(&mut self, blob: Blob, id: BlobId) -> Result<(), Error> {
         if self.blobs.len() == MAX_BLOBS_PER_BATCH {
             return Err(Error::BatchCount(self.blobs.len() + 1));
         }
@@ -148,14 +156,13 @@ impl BatchBuilder {
         if bytes > MAX_BATCH_SIZE {
             return Err(Error::BatchSize(bytes));
         }
-        let id = blob.id();
         if self.ids.contains(&id) {
             return Err(Error::DuplicateBlob(id));
         }
         self.blobs.push(blob);
         self.ids.push(id);
         self.bytes = bytes;
-        Ok(id)
+        Ok(())
     }
 
     /// Reports whether the batch has reached its target or its blob-count bound.
@@ -300,14 +307,16 @@ mod tests {
         let sample = blobs(4, 1024);
         let mut ids = Vec::new();
         for blob in &sample {
-            ids.push(builder.push(blob.clone()).expect("blob is accepted"));
+            let id = blob.id();
+            builder.push(blob.clone(), id).expect("blob is accepted");
+            ids.push(id);
         }
         assert_eq!(builder.len(), 4);
         assert!(builder.bytes() >= 4 * 1024);
 
         // A repeat submission is refused, so the index map stays unambiguous.
         assert!(matches!(
-            builder.push(sample[0].clone()),
+            builder.push(sample[0].clone(), ids[0]),
             Err(Error::DuplicateBlob(_))
         ));
 
@@ -325,11 +334,14 @@ mod tests {
         // The count cap is enforced by the builder, not just by the decoder.
         let mut builder = BatchBuilder::new(usize::MAX);
         for blob in blobs(MAX_BLOBS_PER_BATCH, 32) {
-            builder.push(blob).expect("blob is accepted");
+            let id = blob.id();
+            builder.push(blob, id).expect("blob is accepted");
         }
         assert!(builder.is_full());
+        let extra = blobs(1, 33).remove(0);
+        let extra_id = extra.id();
         assert!(matches!(
-            builder.push(blobs(1, 33).remove(0)),
+            builder.push(extra, extra_id),
             Err(Error::BatchCount(_))
         ));
     }

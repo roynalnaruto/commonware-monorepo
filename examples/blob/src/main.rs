@@ -22,6 +22,7 @@ mod attestor;
 mod blob_tree;
 mod constants;
 mod custody;
+mod gateway;
 #[cfg(test)]
 mod measure;
 mod poseidon2;

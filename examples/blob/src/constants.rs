@@ -117,6 +117,22 @@ pub const BATCH_TIMEOUT: Duration = Duration::from_millis(500);
 /// Batch timer in simulated tests.
 pub const BATCH_TIMEOUT_SIM: Duration = Duration::from_millis(100);
 
+/// How long a gateway waits for a quorum of attestations before abandoning a batch.
+///
+/// Generous relative to the attestation path itself (a worst-case weaken plus check measured
+/// under 14 ms): what this bounds is a slow or partitioned network, not local work.
+pub const DISPERSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Dispersal timer in simulated tests.
+pub const DISPERSE_TIMEOUT_SIM: Duration = Duration::from_millis(500);
+
+/// How many dispersals a blob may take part in before a gateway gives up on it.
+///
+/// A batch that misses its quorum returns its blobs to the batcher, where they join a fresh
+/// batch. Bounding the count is what stops a blob nobody will attest to from circulating forever;
+/// past it the blob is reported failed and the client resubmits.
+pub const MAX_DISPERSAL_ATTEMPTS: u8 = 3;
+
 /// Largest strong shard accepted when decoding a dispersal request.
 ///
 /// A strong shard of an 8 MiB batch at the four-validator deployment measured 4.10 MiB, so this
@@ -135,6 +151,20 @@ pub const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
 /// p2p message bound in simulated tests.
 pub const MAX_MESSAGE_SIZE_SIM: usize = 2 * 1024 * 1024;
+
+/// Largest number of blob statuses a gateway remembers at once.
+///
+/// The status board answers client polls, so it holds entries a client may still ask about rather
+/// than everything ever submitted. Bounding it is what stops an unbounded stream of submissions
+/// from growing the map without limit; the oldest terminal entry is evicted first, and a live
+/// entry is only evicted when nothing terminal is left to drop.
+pub const MAX_TRACKED_BLOBS: usize = 4096;
+
+/// How long a terminal blob status stays on the status board.
+///
+/// A client that never polls should not pin an entry forever. Long enough that a client which
+/// polls at any sensible interval still sees the outcome of its submission.
+pub const STATUS_TTL: Duration = Duration::from_secs(300);
 
 /// Maximum number of views a certificate may age between dispersal and inclusion.
 ///
@@ -171,6 +201,10 @@ mod tests {
             assert!(MAX_MESSAGE_SIZE > MAX_SHARD_SIZE);
             assert!(MAX_MESSAGE_SIZE_SIM > MAX_SHARD_SIZE_SIM);
             assert!(ATTEST_SLACK.get() < FRESHNESS.get());
+            assert!(DISPERSE_TIMEOUT_SIM.as_nanos() < DISPERSE_TIMEOUT.as_nanos());
+            assert!(BATCH_TIMEOUT_SIM.as_nanos() < DISPERSE_TIMEOUT_SIM.as_nanos());
+            assert!(MAX_DISPERSAL_ATTEMPTS > 0);
+            assert!(MAX_TRACKED_BLOBS > MAX_BLOBS_PER_BATCH);
         }
     }
 

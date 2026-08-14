@@ -6,8 +6,12 @@ use crate::{
     poseidon2::{self, FR_SIZE, Fr},
 };
 use bytes::{Buf, BufMut};
-use commonware_codec::{EncodeSize, Error as CodecError, FixedSize, Read, ReadExt, Write};
-use commonware_cryptography::{Signer, Verifier as _, ed25519, transcript::Summary};
+use commonware_codec::{
+    Encode as _, EncodeSize, Error as CodecError, FixedSize, Read, ReadExt, Write,
+};
+use commonware_cryptography::{
+    Digestible, Hasher as _, Sha256, Signer, Verifier as _, ed25519, sha256, transcript::Summary,
+};
 
 /// The gateway's signed claim about a batch's structure.
 ///
@@ -124,6 +128,21 @@ impl EncodeSize for DaCert {
     }
 }
 
+impl Digestible for DaCert {
+    type Digest = sha256::Digest;
+
+    /// Hashes the whole encoding, including the certificate's signer bitmap and the gateway's
+    /// claim.
+    ///
+    /// Gossip addresses certificates by this digest, so it has to separate two certificates over
+    /// the same batch: a second gateway may disperse the same bytes, and a quorum may be
+    /// assembled from different signers. Only the commitment is shared between those, which is
+    /// why the commitment alone would not do.
+    fn digest(&self) -> Self::Digest {
+        Sha256::hash(&[self.encode().as_ref()])
+    }
+}
+
 impl Read for DaCert {
     /// Number of participants in the signing set, which bounds the certificate's signer bitmap.
     type Cfg = usize;
@@ -220,6 +239,65 @@ mod tests {
             assert!(DaCert::decode_cfg(&encoded[..cut], &(PARTICIPANTS as usize)).is_err());
         }
         assert!(DaCert::decode_cfg(encoded, &1usize).is_err());
+    }
+
+    #[test]
+    fn p3_cert_digest_separates_certificates() {
+        let mut rng = test_rng();
+        let fixture = fixture::<Scheme, MinSig, _>(
+            &mut rng,
+            NAMESPACE,
+            PARTICIPANTS,
+            Scheme::signer,
+            Scheme::verifier,
+        );
+        let header = header_at(21);
+        let sign = |range: std::ops::Range<usize>| -> Certificate {
+            let attestations: Vec<Attestation> = fixture.schemes[range]
+                .iter()
+                .map(|scheme| scheme.sign::<Unused>(&header).expect("scheme can sign"))
+                .collect();
+            fixture
+                .verifier
+                .assemble(attestations, &Sequential)
+                .expect("quorum assembles")
+        };
+        let gateway = ed25519::PrivateKey::from_seed(2);
+        let cert = DaCert {
+            header: header.clone(),
+            certificate: sign(0..7),
+            claimed_root: ClaimedRoot::sign(
+                NAMESPACE,
+                &gateway,
+                &header.commitment,
+                Fr::from(5u64),
+            ),
+        };
+
+        // Gossip addresses a certificate by its digest, so the digest has to be a function of the
+        // encoding alone and has to survive a round trip.
+        let decoded =
+            DaCert::decode_cfg(cert.encode(), &(PARTICIPANTS as usize)).expect("cert decodes");
+        assert_eq!(cert.digest(), decoded.digest());
+
+        // Two certificates over the same batch differ, whether the difference is in the signer
+        // set or in the gateway's claim. Only the commitment is common to both.
+        let other_signers = DaCert {
+            certificate: sign(1..8),
+            ..cert.clone()
+        };
+        assert_eq!(other_signers.header.commitment, cert.header.commitment);
+        assert_ne!(other_signers.digest(), cert.digest());
+        let other_root = DaCert {
+            claimed_root: ClaimedRoot::sign(
+                NAMESPACE,
+                &gateway,
+                &header.commitment,
+                Fr::from(6u64),
+            ),
+            ..cert.clone()
+        };
+        assert_ne!(other_root.digest(), cert.digest());
     }
 
     #[test]
