@@ -14,7 +14,7 @@
 //! ```
 
 use crate::{
-    blob_tree,
+    blob_tree::BlobTree,
     constants::{BATCH_TARGET, BATCH_TIMEOUT, MAX_BLOB_SIZE},
     types::{Blob, BlobId},
 };
@@ -94,7 +94,11 @@ fn p1_measure_poseidon2_sealing() {
     let serial = time(|| blobs.iter().map(Blob::id).collect::<Vec<_>>());
     let parallel = time(|| blobs.par_iter().map(Blob::id).collect::<Vec<_>>());
     let ids: Vec<BlobId> = blobs.iter().map(Blob::id).collect();
-    let tree = time(|| blob_tree::root(&ids).expect("count is within bounds"));
+    let tree = time(|| {
+        BlobTree::build(&ids)
+            .expect("count is within bounds")
+            .root()
+    });
 
     println!();
     println!(

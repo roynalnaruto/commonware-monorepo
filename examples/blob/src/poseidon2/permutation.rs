@@ -1,0 +1,192 @@
+//! The Poseidon2 permutation over the BN254 scalar field at state width `t = 4`.
+//!
+//! The external (full-round) matrix follows Barretenberg's addition chain and the internal
+//! (partial-round) matrix uses the vendored diagonal, so this function agrees element for element
+//! with Noir's `std::hash::poseidon2_permutation`.
+
+use super::{
+    Fr,
+    constants::{INTERNAL_DIAGONAL, ROUND_CONSTANTS},
+};
+
+/// Number of field elements in the permutation state.
+pub const WIDTH: usize = 4;
+
+/// Number of field elements absorbed per permutation.
+pub const RATE: usize = 3;
+
+/// Full rounds, split evenly before and after the partial rounds.
+const ROUNDS_F: usize = 8;
+
+/// Partial rounds, applying the S-box to the first state element only.
+const ROUNDS_P: usize = 56;
+
+/// Total rounds, and the number of round-constant rows.
+pub(super) const ROUNDS: usize = ROUNDS_F + ROUNDS_P;
+
+/// The S-box `x^5`.
+#[inline]
+fn sbox(x: Fr) -> Fr {
+    let x2 = x * x;
+    let x4 = x2 * x2;
+    x4 * x
+}
+
+/// The external (full-round) matrix, using Barretenberg's addition chain.
+#[inline]
+fn external_matrix(state: &mut [Fr; WIDTH]) {
+    let t0 = state[0] + state[1];
+    let t1 = state[2] + state[3];
+    let mut t2 = state[1] + state[1];
+    t2 += t1;
+    let mut t3 = state[3] + state[3];
+    t3 += t0;
+    let mut t4 = t1 + t1;
+    t4 += t4;
+    t4 += t3;
+    let mut t5 = t0 + t0;
+    t5 += t5;
+    t5 += t2;
+    let t6 = t3 + t5;
+    let t7 = t2 + t4;
+    state[0] = t6;
+    state[1] = t5;
+    state[2] = t7;
+    state[3] = t4;
+}
+
+/// The internal (partial-round) matrix: `(D_i - 1) * x_i + sum(x)`.
+#[inline]
+fn internal_matrix(state: &mut [Fr; WIDTH]) {
+    let sum = state[0] + state[1] + state[2] + state[3];
+    for (element, diagonal) in state.iter_mut().zip(INTERNAL_DIAGONAL.iter()) {
+        *element *= diagonal;
+        *element += sum;
+    }
+}
+
+/// Applies the Poseidon2 permutation in place.
+pub fn permute(state: &mut [Fr; WIDTH]) {
+    external_matrix(state);
+
+    let half = ROUNDS_F / 2;
+    for constants in ROUND_CONSTANTS.iter().take(half) {
+        for (element, constant) in state.iter_mut().zip(constants.iter()) {
+            *element += constant;
+            *element = sbox(*element);
+        }
+        external_matrix(state);
+    }
+    for constants in ROUND_CONSTANTS.iter().take(half + ROUNDS_P).skip(half) {
+        state[0] += constants[0];
+        state[0] = sbox(state[0]);
+        internal_matrix(state);
+    }
+    for constants in ROUND_CONSTANTS.iter().skip(half + ROUNDS_P) {
+        for (element, constant) in state.iter_mut().zip(constants.iter()) {
+            *element += constant;
+            *element = sbox(*element);
+        }
+        external_matrix(state);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::poseidon2::hash;
+    use ark_ff::MontFp;
+
+    #[test]
+    fn p1_poseidon2_noir_vectors() {
+        // Permutation, `Poseidon2Bn254ScalarFieldParams::TEST_VECTOR_{INPUT,OUTPUT}` from
+        // barretenberg's poseidon2_params.hpp @ 62c2197f7741a80864861e0ebb3462cd3ff4fa24.
+        let mut state = [
+            Fr::from(0u64),
+            Fr::from(1u64),
+            Fr::from(2u64),
+            Fr::from(3u64),
+        ];
+        permute(&mut state);
+        assert_eq!(
+            state,
+            [
+                MontFp!("0x01bd538c2ee014ed5141b29e9ae240bf8db3fe5b9a38629a9647cf8d76c01737"),
+                MontFp!("0x239b62e7db98aa3a2a8f6a0d2fa1709e7a35959aa6c7034814d9daa90cbac662"),
+                MontFp!("0x04cbb44c61d928ed06808456bf758cbf0c18d1e15a7b6dbc8245fa7515d5e3cb"),
+                MontFp!("0x2e11c5cff2a22c64d01304b778d78f6998eff1ab73163a35603f54794c30847a"),
+            ]
+        );
+
+        // Permutation, `Poseidon2Permutation.ConsistencyCheck` from barretenberg's
+        // poseidon2_permutation.test.cpp @ 62c2197f7741a80864861e0ebb3462cd3ff4fa24.
+        let repeated: Fr =
+            MontFp!("0x9a807b615c4d3e2fa0b1c2d3e4f56789fedcba9876543210abcdef0123456789");
+        let mut state = [repeated; WIDTH];
+        permute(&mut state);
+        assert_eq!(
+            state,
+            [
+                MontFp!("0x2bf1eaf87f7d27e8dc4056e9af975985bccc89077a21891d6c7b6ccce0631f95"),
+                MontFp!("0x0c01fa1b8d0748becafbe452c0cb0231c38224ea824554c9362518eebdd5701f"),
+                MontFp!("0x018555a8eb50cf07f64b019ebaf3af3c925c93e631f3ecd455db07bbb52bbdd3"),
+                MontFp!("0x0cbea457c91c22c6c31fd89afd2541efc2edf31736b9f721e823b2165c90fd41"),
+            ]
+        );
+
+        // Sponge, `finish_ref_matches_known_digest` from noir_stdlib/src/hash/poseidon2.nr @
+        // v1.0.0-beta.26. This is the Noir standard library asserting its own digest, so it pins
+        // the sponge, the permutation, and every round constant at once.
+        let inputs: Vec<Fr> = (1u64..=5).map(Fr::from).collect();
+        assert_eq!(
+            hash(&inputs),
+            MontFp!("0x2247be7014a54d17342a7ef677f58d28877780d203860396967f5d0a18d259db")
+        );
+
+        // Regression vectors for the input lengths the rail actually uses, generated by running
+        // the same sponge over Noir's own permutation (`bn254_blackbox_solver::poseidon2_permutation`
+        // at v1.0.0-beta.26) rather than the one below. They cover an empty input, every residue of
+        // the rate, and a full 4 KiB page worth of limbs plus a tag.
+        for (len, expected) in [
+            (
+                0,
+                MontFp!("0x18dfb8dc9b82229cff974efefc8df78b1ce96d9d844236b496785c698bc6732e"),
+            ),
+            (
+                1,
+                MontFp!("0x168758332d5b3e2d13be8048c8011b454590e06c44bce7f702f09103eef5a373"),
+            ),
+            (
+                2,
+                MontFp!("0x038682aa1cb5ae4e0a3f13da432a95c77c5c111f6f030faf9cad641ce1ed7383"),
+            ),
+            (
+                3,
+                MontFp!("0x16f5da1a6b40e7d71bcdf29687e7908cdf74da44c09058fe36a0a99e269c6972"),
+            ),
+            (
+                4,
+                MontFp!("0x130bf204a32cac1f0ace56c78b731aa3809f06df2731ebcf6b3464a15788b1b9"),
+            ),
+            (
+                6,
+                MontFp!("0x04a7639afe4c6a14a65325370b03098ad98d16594dc67e28d9b6d28b2b01c15e"),
+            ),
+            (
+                7,
+                MontFp!("0x16f929bc0d216df4b05bdc44222463edf2b9791bd949ab926eebda06a502d238"),
+            ),
+            (
+                10,
+                MontFp!("0x1cf91a7e72341f2804e3a5dd7c7e2b05cb27beb864104a26a4c6c39738b52947"),
+            ),
+            (
+                134,
+                MontFp!("0x10c9e4d01fa7959ea4ef908ded893ed8662ffbb69d728636af788bd6cc2052db"),
+            ),
+        ] {
+            let inputs: Vec<Fr> = (1..=len as u64).map(Fr::from).collect();
+            assert_eq!(hash(&inputs), expected, "sponge vector for length {len}");
+        }
+    }
+}

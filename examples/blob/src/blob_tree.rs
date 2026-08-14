@@ -1,15 +1,20 @@
 //! Fixed-depth padded Poseidon2 Merkle trees over pages and over blob identities.
 //!
-//! Two trees, one shape. The **page tree** sits inside a blob: its leaves are the blob's 4 KiB
-//! pages and its root is folded into the [`BlobId`]. The **blob tree** sits
-//! over a batch: its leaves are the batch's blob identities and its root is what a gateway claims
-//! inside a [`DaCert`](crate::types::DaCert).
+//! Two trees, one shape. The **page tree** ([`PageTree`]) sits inside a blob: its leaves are the
+//! blob's 4 KiB pages and its root is folded into the [`BlobId`]. The **blob tree**
+//! ([`BlobTree`]) sits over a batch: its leaves are the batch's blob identities and its root is
+//! what a gateway claims inside a [`DaCert`](crate::types::DaCert).
 //!
 //! Both are binary, both are a fixed depth, and both pad missing slots with precomputed
 //! empty-subtree digests. Fixed depth is the point: a membership path is always exactly
 //! [`PAGE_DEPTH`] or [`BATCH_DEPTH`] field elements, so a Noir circuit verifying one has no
 //! variable-length loop. `commonware_storage::bmt` is deliberately not used here, because its
 //! depth follows the leaf count and its padding is a library detail rather than a wire constant.
+//!
+//! A tree is folded once by [`BlobTree::build`] or [`PageTree::build`] and then answers any number
+//! of [`prove`](BlobTree::prove) calls from the levels it kept. A proof carries the index it was
+//! taken at, so verification needs only the root and the content being opened, and a verifier
+//! never builds a tree at all.
 //!
 //! # Integrity tier
 //!
@@ -19,7 +24,7 @@
 //! subject.
 
 use crate::{
-    constants::{BLOB_PAGE, MAX_BLOBS_PER_BATCH},
+    constants::BLOB_PAGE,
     poseidon2::{self, Fr, Hasher, TAG_EMPTY, TAG_LEAF, TAG_NODE, TAG_PAGE},
     types::{Blob, BlobId, Error},
 };
@@ -31,12 +36,6 @@ pub const BATCH_DEPTH: usize = 8;
 
 /// Depth of the page tree: `2^7 = 128 = MAX_BLOB_SIZE / BLOB_PAGE` leaves.
 pub const PAGE_DEPTH: usize = 7;
-
-/// Membership path of a blob identity in the blob tree, sibling digests from leaf to root.
-pub type BatchPath = [Fr; BATCH_DEPTH];
-
-/// Membership path of a page in a blob's page tree, sibling digests from leaf to root.
-pub type PagePath = [Fr; PAGE_DEPTH];
 
 /// Roots of the all-empty subtree at each level, `EMPTY[k]` covering `2^k` padded leaves.
 static EMPTY: LazyLock<[Fr; BATCH_DEPTH + 1]> = LazyLock::new(|| {
@@ -69,46 +68,50 @@ fn blob_leaf(id: &BlobId) -> Fr {
     poseidon2::hash(&[TAG_LEAF, id.element()])
 }
 
-/// Folds `leaves` into the root of a depth-`D` tree padded with empty subtrees.
-fn root_of<const D: usize>(leaves: &[Fr]) -> Fr {
-    if leaves.is_empty() {
-        return EMPTY[D];
-    }
-    let mut level = leaves.to_vec();
+/// Folds `leaves` into every level of a depth-`D` tree padded with empty subtrees, leaves first
+/// and the root last.
+///
+/// At most `2^D` leaves may be supplied; an empty slice folds to the all-empty tree, so the last
+/// level always holds exactly one element.
+fn build_levels<const D: usize>(leaves: Vec<Fr>) -> Vec<Vec<Fr>> {
+    let mut level = if leaves.is_empty() {
+        vec![EMPTY[0]]
+    } else {
+        leaves
+    };
+    let mut levels = Vec::with_capacity(D + 1);
     for depth in 0..D {
         let mut next = Vec::with_capacity(level.len().div_ceil(2));
         for pair in level.chunks(2) {
             let right = pair.get(1).copied().unwrap_or(EMPTY[depth]);
             next.push(node(pair[0], right));
         }
+        levels.push(level);
         level = next;
     }
-    level[0]
+    levels.push(level);
+    levels
 }
 
-/// Collects the sibling digests on the path from leaf `index` to the root.
-fn path_of<const D: usize>(leaves: &[Fr], index: usize) -> [Fr; D] {
-    let mut path = [Fr::ZERO; D];
-    let mut level = leaves.to_vec();
+/// Collects the sibling digests on the path from leaf `index` to the root of `levels`.
+fn path_from_levels<const D: usize>(levels: &[Vec<Fr>], index: usize) -> [Fr; D] {
+    let mut siblings = [Fr::ZERO; D];
     let mut position = index;
-    for (depth, sibling) in path.iter_mut().enumerate() {
-        *sibling = level.get(position ^ 1).copied().unwrap_or(EMPTY[depth]);
-        let mut next = Vec::with_capacity(level.len().div_ceil(2));
-        for pair in level.chunks(2) {
-            let right = pair.get(1).copied().unwrap_or(EMPTY[depth]);
-            next.push(node(pair[0], right));
-        }
-        level = next;
+    for (depth, sibling) in siblings.iter_mut().enumerate() {
+        *sibling = levels[depth]
+            .get(position ^ 1)
+            .copied()
+            .unwrap_or(EMPTY[depth]);
         position /= 2;
     }
-    path
+    siblings
 }
 
-/// Recomputes the root implied by a leaf and its path.
-fn root_from_path<const D: usize>(index: usize, leaf: Fr, path: &[Fr; D]) -> Fr {
+/// Recomputes the root implied by `leaf` at `index` and its sibling digests.
+fn root_from_path<const D: usize>(index: usize, leaf: Fr, siblings: &[Fr; D]) -> Fr {
     let mut current = leaf;
     let mut position = index;
-    for sibling in path {
+    for sibling in siblings {
         current = if position.is_multiple_of(2) {
             node(current, *sibling)
         } else {
@@ -119,30 +122,133 @@ fn root_from_path<const D: usize>(index: usize, leaf: Fr, path: &[Fr; D]) -> Fr 
     current
 }
 
-/// Returns the blob-tree root over a batch's identities.
-pub fn root(ids: &[BlobId]) -> Result<Fr, Error> {
-    if ids.is_empty() || ids.len() > MAX_BLOBS_PER_BATCH {
-        return Err(Error::BatchCount(ids.len()));
-    }
-    let leaves: Vec<Fr> = ids.iter().map(blob_leaf).collect();
-    Ok(root_of::<BATCH_DEPTH>(&leaves))
+/// The depth-8 tree over a batch's blob identities.
+///
+/// Folded once and then queried: a gateway that seals a batch of 256 blobs pays for one fold, not
+/// one per opening.
+#[derive(Clone, Debug)]
+pub struct BlobTree {
+    /// Every level, leaves at index 0 and the root alone at index [`BATCH_DEPTH`].
+    levels: Vec<Vec<Fr>>,
 }
 
-/// Returns the membership path of the blob at `index`.
-pub fn prove(ids: &[BlobId], index: usize) -> Result<BatchPath, Error> {
-    if ids.is_empty() || ids.len() > MAX_BLOBS_PER_BATCH {
-        return Err(Error::BatchCount(ids.len()));
+impl BlobTree {
+    /// Folds the tree over `ids`, rejecting a batch outside the permitted count range.
+    pub fn build(ids: &[BlobId]) -> Result<Self, Error> {
+        if ids.is_empty() || ids.len() > (1 << BATCH_DEPTH) {
+            return Err(Error::BatchCount(ids.len()));
+        }
+        let leaves = ids.iter().map(blob_leaf).collect();
+        Ok(Self {
+            levels: build_levels::<BATCH_DEPTH>(leaves),
+        })
     }
-    if index >= ids.len() {
-        return Err(Error::UnknownIndex(index));
+
+    /// Returns the blob-tree root.
+    pub fn root(&self) -> Fr {
+        self.levels[BATCH_DEPTH][0]
     }
-    let leaves: Vec<Fr> = ids.iter().map(blob_leaf).collect();
-    Ok(path_of::<BATCH_DEPTH>(&leaves, index))
+
+    /// Returns the membership proof of the blob identity at `index`.
+    pub fn prove(&self, index: usize) -> Result<BatchProof, Error> {
+        if index >= self.levels[0].len() {
+            return Err(Error::UnknownIndex(index));
+        }
+        Ok(BatchProof {
+            index: index as u16,
+            siblings: path_from_levels::<BATCH_DEPTH>(&self.levels, index),
+        })
+    }
 }
 
-/// Checks that `id` occupies `index` of the blob tree with root `root`.
-pub fn verify(root: &Fr, index: usize, id: &BlobId, path: &BatchPath) -> bool {
-    index < MAX_BLOBS_PER_BATCH && root_from_path(index, blob_leaf(id), path) == *root
+/// The depth-7 tree over one blob's pages.
+#[derive(Clone, Debug)]
+pub struct PageTree {
+    /// Every level, leaves at index 0 and the root alone at index [`PAGE_DEPTH`].
+    levels: Vec<Vec<Fr>>,
+}
+
+impl PageTree {
+    /// Folds the page tree of `blob`.
+    ///
+    /// Infallible: a [`Blob`] is size-checked on construction, so its page count is always between
+    /// one and the tree's capacity.
+    pub fn build(blob: &Blob) -> Self {
+        let leaves = (0..page_count(blob.len()))
+            .map(|index| page_leaf(page(blob, index).expect("page index is below the page count")))
+            .collect();
+        Self {
+            levels: build_levels::<PAGE_DEPTH>(leaves),
+        }
+    }
+
+    /// Returns the page-tree root, the value a [`BlobId`] commits to.
+    pub fn root(&self) -> Fr {
+        self.levels[PAGE_DEPTH][0]
+    }
+
+    /// Returns the membership proof of the page at `page`.
+    pub fn prove(&self, page: usize) -> Result<PageProof, Error> {
+        if page >= self.levels[0].len() {
+            return Err(Error::UnknownIndex(page));
+        }
+        Ok(PageProof {
+            index: page as u8,
+            siblings: path_from_levels::<PAGE_DEPTH>(&self.levels, page),
+        })
+    }
+}
+
+/// A blob identity's membership in a blob tree.
+///
+/// Self-contained: it names the slot it was taken from, so a verifier cannot pair it with the
+/// wrong index by accident.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BatchProof {
+    /// Slot the identity occupies in the batch.
+    index: u16,
+    /// Sibling digests from leaf to root.
+    siblings: [Fr; BATCH_DEPTH],
+}
+
+impl BatchProof {
+    /// Returns the slot the proven identity occupies.
+    pub const fn index(&self) -> u16 {
+        self.index
+    }
+
+    /// Checks that `id` occupies this proof's slot of the blob tree with root `root`.
+    pub fn verify(&self, root: &Fr, id: &BlobId) -> bool {
+        let index = self.index as usize;
+        index < (1 << BATCH_DEPTH) && root_from_path(index, blob_leaf(id), &self.siblings) == *root
+    }
+}
+
+/// A page's membership in a blob's page tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageProof {
+    /// Position the page occupies in the blob.
+    index: u8,
+    /// Sibling digests from leaf to root.
+    siblings: [Fr; PAGE_DEPTH],
+}
+
+impl PageProof {
+    /// Returns the position of the proven page.
+    pub const fn index(&self) -> u8 {
+        self.index
+    }
+
+    /// Checks that `page` occupies this proof's position of the page tree with root `page_root`.
+    ///
+    /// The caller is responsible for binding `page_root` to a [`BlobId`] (see
+    /// [`BlobId::matches`](crate::types::BlobId::matches)) and for checking that the length of
+    /// `page` is the one the blob length implies for that position; this only proves membership.
+    pub fn verify(&self, page_root: &Fr, page: &[u8]) -> bool {
+        let index = self.index as usize;
+        index < (1 << PAGE_DEPTH)
+            && root_from_path(index, page_leaf(page), &self.siblings) == *page_root
+    }
 }
 
 /// Returns the number of pages a blob of `len` bytes occupies.
@@ -159,38 +265,10 @@ pub fn page(blob: &Blob, index: usize) -> Option<&[u8]> {
     (start < bytes.len()).then(|| &bytes[start..bytes.len().min(start + BLOB_PAGE)])
 }
 
-/// Returns the page-tree root of a blob.
-pub fn page_root(blob: &Blob) -> Fr {
-    let leaves: Vec<Fr> = (0..page_count(blob.len()))
-        .map(|index| page_leaf(page(blob, index).expect("page index is below the page count")))
-        .collect();
-    root_of::<PAGE_DEPTH>(&leaves)
-}
-
-/// Returns the membership path of page `index` within a blob's page tree.
-pub fn prove_page(blob: &Blob, index: usize) -> Result<PagePath, Error> {
-    if index >= page_count(blob.len()) {
-        return Err(Error::UnknownIndex(index));
-    }
-    let leaves: Vec<Fr> = (0..page_count(blob.len()))
-        .map(|index| page_leaf(page(blob, index).expect("page index is below the page count")))
-        .collect();
-    Ok(path_of::<PAGE_DEPTH>(&leaves, index))
-}
-
-/// Checks that `page` occupies `index` of the page tree with root `page_root`.
-///
-/// The caller is responsible for binding `page_root` to a [`BlobId`] (see
-/// [`BlobId::matches`](crate::types::BlobId::matches)) and for checking that the length of `page`
-/// is the one the blob length implies for that index; this function only proves membership.
-pub fn verify_page(page_root: &Fr, index: usize, page: &[u8], path: &PagePath) -> bool {
-    index < (1 << PAGE_DEPTH) && root_from_path(index, page_leaf(page), path) == *page_root
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constants::MAX_BLOB_SIZE;
+    use crate::constants::{MAX_BLOB_SIZE, MAX_BLOBS_PER_BATCH};
     use bytes::Bytes;
 
     /// Builds `count` distinct blobs, each `len` bytes.
@@ -226,26 +304,29 @@ mod tests {
     fn p1_blob_tree_membership_roundtrip() {
         for count in [1usize, 2, 3, 5, 8, 17, MAX_BLOBS_PER_BATCH] {
             let ids: Vec<BlobId> = blobs(count, 64).iter().map(Blob::id).collect();
-            let root = root(&ids).expect("count is within bounds");
+            let tree = BlobTree::build(&ids).expect("count is within bounds");
+            let root = tree.root();
 
             for index in sampled(count) {
                 let id = &ids[index];
-                let path = prove(&ids, index).expect("index is occupied");
-                assert!(
-                    verify(&root, index, id, &path),
-                    "count {count} index {index}"
-                );
+                let proof = tree.prove(index).expect("index is occupied");
+                assert_eq!(proof.index(), index as u16);
+                assert!(proof.verify(&root, id), "count {count} index {index}");
 
                 // Wrong index, wrong identity, wrong root, and a tampered path all fail.
                 let other = (index + 1) % count;
                 if other != index {
-                    assert!(!verify(&root, other, id, &path));
-                    assert!(!verify(&root, index, &ids[other], &path));
+                    let moved = BatchProof {
+                        index: other as u16,
+                        siblings: proof.siblings,
+                    };
+                    assert!(!moved.verify(&root, id));
+                    assert!(!proof.verify(&root, &ids[other]));
                 }
-                assert!(!verify(&(root + Fr::from(1u64)), index, id, &path));
-                let mut tampered = path;
-                tampered[0] += Fr::from(1u64);
-                assert!(!verify(&root, index, id, &tampered));
+                assert!(!proof.verify(&(root + Fr::from(1u64)), id));
+                let mut tampered = proof;
+                tampered.siblings[0] += Fr::from(1u64);
+                assert!(!tampered.verify(&root, id));
             }
         }
     }
@@ -253,29 +334,37 @@ mod tests {
     #[test]
     fn p1_blob_tree_padded_slots_are_not_members() {
         let ids: Vec<BlobId> = blobs(5, 64).iter().map(Blob::id).collect();
-        let root = root(&ids).expect("count is within bounds");
+        let tree = BlobTree::build(&ids).expect("count is within bounds");
+        let root = tree.root();
 
-        // No path exists for an unoccupied slot.
-        assert!(matches!(prove(&ids, 5), Err(Error::UnknownIndex(5))));
+        // No proof exists for an unoccupied slot.
+        assert!(matches!(tree.prove(5), Err(Error::UnknownIndex(5))));
 
         // And no identity can be planted in one: the padded siblings of slot 5 form the only path
         // that reaches the root there, and it commits to the empty leaf, not to a blob.
-        let padded: BatchPath = [
-            EMPTY[0], EMPTY[1], EMPTY[2], EMPTY[3], EMPTY[4], EMPTY[5], EMPTY[6], EMPTY[7],
-        ];
+        let padded = BatchProof {
+            index: 5,
+            siblings: [
+                EMPTY[0], EMPTY[1], EMPTY[2], EMPTY[3], EMPTY[4], EMPTY[5], EMPTY[6], EMPTY[7],
+            ],
+        };
         for id in &ids {
-            assert!(!verify(&root, 5, id, &padded));
+            assert!(!padded.verify(&root, id));
         }
     }
 
     #[test]
     fn p1_blob_tree_rejects_out_of_range_counts() {
         let ids: Vec<BlobId> = blobs(1, 64).iter().map(Blob::id).collect();
-        assert!(matches!(root(&[]), Err(Error::BatchCount(0))));
-        assert!(matches!(prove(&ids, 1), Err(Error::UnknownIndex(1))));
+        assert!(matches!(BlobTree::build(&[]), Err(Error::BatchCount(0))));
+        let tree = BlobTree::build(&ids).expect("count is within bounds");
+        assert!(matches!(tree.prove(1), Err(Error::UnknownIndex(1))));
 
         let too_many = vec![ids[0]; MAX_BLOBS_PER_BATCH + 1];
-        assert!(matches!(root(&too_many), Err(Error::BatchCount(257))));
+        assert!(matches!(
+            BlobTree::build(&too_many),
+            Err(Error::BatchCount(257))
+        ));
     }
 
     #[test]
@@ -283,34 +372,33 @@ mod tests {
         // A multi-page blob with a short final page, and one that is exactly page aligned.
         for len in [BLOB_PAGE * 3 + 17, BLOB_PAGE * 4, MAX_BLOB_SIZE] {
             let blob = blobs(1, len).remove(0);
-            let root = page_root(&blob);
+            let tree = PageTree::build(&blob);
+            let root = tree.root();
             let pages = page_count(len);
             assert_eq!(pages, len.div_ceil(BLOB_PAGE));
 
             for index in sampled(pages) {
                 let bytes = page(&blob, index).expect("page index is occupied");
-                let path = prove_page(&blob, index).expect("page index is occupied");
-                assert!(
-                    verify_page(&root, index, bytes, &path),
-                    "len {len} page {index}"
-                );
+                let proof = tree.prove(index).expect("page index is occupied");
+                assert_eq!(proof.index(), index as u8);
+                assert!(proof.verify(&root, bytes), "len {len} page {index}");
 
                 // A tampered window, a shifted window, and the wrong index all fail.
                 let mut tampered = bytes.to_vec();
                 tampered[0] ^= 1;
-                assert!(!verify_page(&root, index, &tampered, &path));
-                assert!(!verify_page(&root, index, &bytes[1..], &path));
+                assert!(!proof.verify(&root, &tampered));
+                assert!(!proof.verify(&root, &bytes[1..]));
                 if pages > 1 {
-                    let other = (index + 1) % pages;
-                    assert!(!verify_page(&root, other, bytes, &path));
+                    let moved = PageProof {
+                        index: ((index + 1) % pages) as u8,
+                        siblings: proof.siblings,
+                    };
+                    assert!(!moved.verify(&root, bytes));
                 }
             }
 
             assert!(page(&blob, pages).is_none());
-            assert!(matches!(
-                prove_page(&blob, pages),
-                Err(Error::UnknownIndex(_))
-            ));
+            assert!(matches!(tree.prove(pages), Err(Error::UnknownIndex(_))));
         }
     }
 
@@ -322,7 +410,10 @@ mod tests {
         let (left, right) = swapped.split_at_mut(BLOB_PAGE);
         left.swap_with_slice(right);
         let swapped = Blob::new(Bytes::from(swapped)).expect("blob is within bounds");
-        assert_ne!(page_root(&blob), page_root(&swapped));
+        assert_ne!(
+            PageTree::build(&blob).root(),
+            PageTree::build(&swapped).root()
+        );
     }
 
     #[test]

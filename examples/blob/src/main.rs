@@ -22,7 +22,6 @@ mod constants;
 #[cfg(test)]
 mod measure;
 mod poseidon2;
-mod poseidon2_constants;
 mod types;
 mod wire;
 

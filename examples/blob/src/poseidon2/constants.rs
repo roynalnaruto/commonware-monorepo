@@ -19,11 +19,14 @@
 //! `INTERNAL_MATRIX_DIAGONAL`. Changing any value here is a wire-format break: it changes every
 //! [`BlobId`](crate::types::BlobId) and every blob-tree root.
 
-use crate::poseidon2::{Fr, ROUNDS, WIDTH};
+use super::{
+    Fr,
+    permutation::{ROUNDS, WIDTH},
+};
 use ark_ff::MontFp;
 
 /// Diagonal `D_i - 1` of the internal (partial-round) matrix.
-pub(crate) const INTERNAL_DIAGONAL: [Fr; WIDTH] = [
+pub(super) const INTERNAL_DIAGONAL: [Fr; WIDTH] = [
     MontFp!("0x10dc6e9c006ea38b04b1e03b4bd9490c0d03f98929ca1d7fb56821fd19d3b6e7"),
     MontFp!("0x0c28145b6a44df3e0149b3d0a30b3bb599df9756d4dd9b84a86b38cfb45a740b"),
     MontFp!("0x00544b8338791518b2c7645a50392798b21f75bb60e3596170067d00141cac15"),
@@ -31,7 +34,7 @@ pub(crate) const INTERNAL_DIAGONAL: [Fr; WIDTH] = [
 ];
 
 /// Round constants, one row per round. Rows in the partial-round band only use column 0.
-pub(crate) const ROUND_CONSTANTS: [[Fr; WIDTH]; ROUNDS] = [
+pub(super) const ROUND_CONSTANTS: [[Fr; WIDTH]; ROUNDS] = [
     [
         MontFp!("0x19b849f69450b06848da1d39bd5e4a4302bb86744edc26238b0878e269ed23e5"),
         MontFp!("0x265ddfe127dd51bd7239347b758f0a1320eb2cc7450acc1dad47f80c8dcf34d6"),
