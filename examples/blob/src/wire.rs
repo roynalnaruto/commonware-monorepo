@@ -402,7 +402,7 @@ impl Read for ClientResponse {
 mod tests {
     use super::*;
     use crate::{
-        constants::{MAX_SHARD_SIZE_SIM, NAMESPACE},
+        constants::{MAX_SHARD_SIZE_SIM, NAMESPACE, coding_namespace},
         poseidon2::Fr,
         types::{ClaimedRoot, Scheme},
     };
@@ -474,8 +474,13 @@ mod tests {
             Blob::new(Bytes::from(vec![11u8; 1024])).expect("blob is within bounds"),
         ])
         .expect("batch is within bounds");
-        let (commitment, shards) =
-            Coder::encode(NAMESPACE, &config, batch.encode(), &Sequential).expect("encode");
+        let (commitment, shards) = Coder::encode(
+            &coding_namespace(NAMESPACE),
+            &config,
+            batch.encode(),
+            &Sequential,
+        )
+        .expect("encode");
         (BatchHeader::new(commitment, config, View::new(3)), shards)
     }
 

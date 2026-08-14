@@ -1383,6 +1383,7 @@ dependencies = [
  "ark-ff",
  "bytes",
  "clap",
+ "commonware-actor",
  "commonware-codec",
  "commonware-coding",
  "commonware-collector",
@@ -1390,12 +1391,15 @@ dependencies = [
  "commonware-cryptography",
  "commonware-formatting",
  "commonware-parallel",
+ "commonware-runtime",
+ "commonware-storage",
  "commonware-utils",
  "rand 0.10.2",
  "rand_chacha 0.10.0",
  "rand_core 0.10.1",
  "rayon",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]

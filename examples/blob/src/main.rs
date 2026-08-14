@@ -17,11 +17,16 @@
 // inside this binary yet.
 #![allow(dead_code)]
 
+mod assignment;
+mod attestor;
 mod blob_tree;
 mod constants;
+mod custody;
 #[cfg(test)]
 mod measure;
 mod poseidon2;
+#[cfg(test)]
+mod test_util;
 mod types;
 mod wire;
 

@@ -22,6 +22,9 @@ pub const ATTEST_SUFFIX: &[u8] = b"_DA_ATTEST";
 /// Suffix for the gateway signature over `(commitment, blob-tree root)`.
 pub const GATEWAY_ROOT_SUFFIX: &[u8] = b"_GATEWAY_ROOT";
 
+/// Suffix for the domain separator a batch is erasure-coded under.
+pub const CODING_SUFFIX: &[u8] = b"_DA_CODING";
+
 /// Returns the namespace attestors sign batch headers under.
 pub fn attest_namespace(namespace: &[u8]) -> Vec<u8> {
     union(namespace, ATTEST_SUFFIX)
@@ -33,6 +36,14 @@ pub fn attest_namespace(namespace: &[u8]) -> Vec<u8> {
 /// claim, not an attestation, and the two must never be confusable.
 pub fn gateway_root_namespace(namespace: &[u8]) -> Vec<u8> {
     union(namespace, GATEWAY_ROOT_SUFFIX)
+}
+
+/// Returns the namespace batches are erasure-coded under.
+///
+/// A gateway passes this to `encode` and every attestor passes it to `weaken`. The two must
+/// agree: under a different namespace a shard fails its check even though the bytes are intact.
+pub fn coding_namespace(namespace: &[u8]) -> Vec<u8> {
+    union(namespace, CODING_SUFFIX)
 }
 
 /// Consensus votes.
@@ -136,6 +147,14 @@ pub const FRESHNESS: ViewDelta = ViewDelta::new(32);
 /// Custody keeps a shard until view `D + FRESHNESS + WINDOW`.
 pub const WINDOW: ViewDelta = ViewDelta::new(64);
 
+/// How far a dispersal view may sit either side of an attestor's watermark.
+///
+/// A gateway disperses at the view it believes is current, which may lead or lag the attestor's
+/// last observed finalized view. Accepting a band rather than an exact match tolerates that skew;
+/// keeping the band well inside [`FRESHNESS`] stops a gateway from post-dating a batch far enough
+/// to escape the freshness rule applied when its certificate is included.
+pub const ATTEST_SLACK: ViewDelta = ViewDelta::new(16);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,6 +170,7 @@ mod tests {
             assert!(MAX_SHARD_SIZE_SIM < MAX_SHARD_SIZE);
             assert!(MAX_MESSAGE_SIZE > MAX_SHARD_SIZE);
             assert!(MAX_MESSAGE_SIZE_SIM > MAX_SHARD_SIZE_SIM);
+            assert!(ATTEST_SLACK.get() < FRESHNESS.get());
         }
     }
 
@@ -158,8 +178,12 @@ mod tests {
     fn p1_constants_namespaces_are_distinct() {
         let attest = attest_namespace(NAMESPACE);
         let gateway = gateway_root_namespace(NAMESPACE);
+        let coding = coding_namespace(NAMESPACE);
         assert_ne!(attest, gateway);
+        assert_ne!(attest, coding);
+        assert_ne!(gateway, coding);
         assert!(attest.starts_with(NAMESPACE));
         assert!(gateway.starts_with(NAMESPACE));
+        assert!(coding.starts_with(NAMESPACE));
     }
 }

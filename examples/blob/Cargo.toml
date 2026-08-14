@@ -20,18 +20,22 @@ ark-bn254 = { version = "0.6.0", default-features = false, features = ["scalar_f
 ark-ff = { version = "0.6.0", default-features = false, features = ["asm", "std"] }
 bytes = { workspace = true, features = ["std"] }
 clap.workspace = true
+commonware-actor.workspace = true
 commonware-codec = { workspace = true, features = ["std"] }
 commonware-coding.workspace = true
+commonware-collector.workspace = true
 commonware-consensus.workspace = true
 commonware-cryptography = { workspace = true, features = ["std"] }
 commonware-formatting = { workspace = true, features = ["std"] }
 commonware-parallel = { workspace = true, features = ["std"] }
+commonware-runtime.workspace = true
+commonware-storage = { workspace = true, features = ["std"] }
 commonware-utils = { workspace = true, features = ["std"] }
 rand_core.workspace = true
 thiserror = { workspace = true, features = ["std"] }
+tracing.workspace = true
 
 [dev-dependencies]
-commonware-collector.workspace = true
 commonware-cryptography = { workspace = true, features = ["mocks", "std"] }
 rand = { workspace = true, features = ["std_rng", "alloc"] }
 rand_chacha.workspace = true
