@@ -13,6 +13,19 @@
 //! Under construction. The subcommands below parse and then exit non-zero; the validator and client
 //! roles are built out in later stages.
 
+// The wire vocabulary is defined ahead of the actors that consume it, so most of it has no caller
+// inside this binary yet.
+#![allow(dead_code)]
+
+mod blob_tree;
+mod constants;
+#[cfg(test)]
+mod measure;
+mod poseidon2;
+mod poseidon2_constants;
+mod types;
+mod wire;
+
 use clap::Command;
 use std::process::ExitCode;
 
