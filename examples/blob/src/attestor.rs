@@ -28,7 +28,7 @@ use crate::{
 use commonware_actor::mailbox::{self, Policy, Receiver, Sender};
 use commonware_coding::{Config as CodingConfig, PhasedScheme as _};
 use commonware_consensus::types::{View, ViewDelta};
-use commonware_cryptography::{certificate::Scheme as _, ed25519, sha256};
+use commonware_cryptography::{certificate::Scheme as _, ed25519, sha256, transcript::Summary};
 use commonware_runtime::{
     BufferPooler, ContextCell, Handle, Metrics, Spawner, Storage, spawn_cell,
 };
@@ -98,6 +98,13 @@ enum Message {
         /// The latest finalized view.
         finalized: View,
     },
+    /// A reader wants the shard this node holds for a batch.
+    Fetch {
+        /// Commitment of the batch.
+        commitment: Summary,
+        /// Where the record goes, dropped if nothing is held.
+        response: oneshot::Sender<CustodyRecord>,
+    },
 }
 
 impl Policy for Message {
@@ -106,7 +113,9 @@ impl Policy for Message {
     fn handle(overflow: &mut VecDeque<Self>, message: Self) {
         // A dispersal is worth keeping under load: the gateway is waiting on a quorum, and a
         // request dropped here costs it one of the attestations it needs. A dropped prune would
-        // leave custody holding shards nobody can ask for until the next finalization.
+        // leave custody holding shards nobody can ask for until the next finalization. A read is
+        // kept too, but it is the one message whose caller can cope with being dropped: a reader
+        // that hears nothing simply fetches the shard from a peer instead.
         overflow.push_back(message);
     }
 }
@@ -129,6 +138,31 @@ impl Mailbox {
     /// attestation being signed. Returns whether the attestor accepted the report.
     pub fn prune(&self, finalized: View) -> bool {
         self.sender.enqueue(Message::Prune { finalized }).accepted()
+    }
+
+    /// Returns the shard this node custodies for `commitment`, if it holds one.
+    ///
+    /// The read side of the same single-owner rule pruning follows: custody has one owner, and a
+    /// second handle on the store would read shards a prune is part-way through dropping. The
+    /// attestor sits on no consensus path, so the hop costs a message.
+    ///
+    /// `None` covers every way there is nothing to serve — never attested, already expired, the
+    /// store failed, or the attestor has stopped — because a reader does the same thing in all
+    /// of them: ask a peer instead.
+    pub async fn fetch(&self, commitment: Summary) -> Option<CustodyRecord> {
+        let (response, receiver) = oneshot::channel();
+        if !self
+            .sender
+            .enqueue(Message::Fetch {
+                commitment,
+                response,
+            })
+            .accepted()
+        {
+            debug!(?commitment, "attestor is stopped; shard read dropped");
+            return None;
+        }
+        receiver.await.ok()
     }
 }
 
@@ -242,6 +276,21 @@ impl<E: BufferPooler + Metrics + Spawner + Storage> Attestor<E> {
                     if let Err(err) = self.custody.prune(finalized).await {
                         error!(?err, "custody failed; attestor stopping");
                         return;
+                    }
+                }
+                Message::Fetch {
+                    commitment,
+                    response,
+                } => {
+                    // A read that fails is not fatal the way a write is: nothing has been claimed
+                    // on the strength of it, and the reader has other custodians to ask. Dropping
+                    // the responder is the whole of the answer.
+                    match self.custody.get(&commitment).await {
+                        Ok(Some(record)) => {
+                            let _ = response.send(record);
+                        }
+                        Ok(None) => debug!(?commitment, "no shard held"),
+                        Err(err) => warn!(?commitment, ?err, "custody read failed"),
                     }
                 }
             }

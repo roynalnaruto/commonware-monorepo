@@ -349,18 +349,109 @@ impl Read for ClientRequest {
     }
 }
 
+/// The outcome of a [`ClientRequest::GetBatch`].
+///
+/// A miss is named rather than left as an absent value, because the three of them mean different
+/// things to a client: a batch nobody finalized may still be on its way, one past its window is
+/// gone for good, and one that could not be gathered in time is worth asking another validator
+/// for. None of them is a claim the client has to trust: the only answer it acts on is
+/// [`BatchResult::Found`], and that one it re-derives from the bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BatchResult {
+    /// The batch, and the certificate that says a quorum custodies it.
+    Found {
+        /// The reconstructed batch.
+        batch: Batch,
+        /// The certificate the responding validator holds over it.
+        cert: Box<DaCert>,
+    },
+    /// No certificate over this commitment has been finalized, as far as this validator knows.
+    Unknown,
+    /// A certificate was finalized, but the batch is past its retrievability window.
+    Expired,
+    /// The certificate is live, but enough shards could not be gathered in time.
+    Unavailable,
+}
+
+impl BatchResult {
+    /// Wire tag for [`BatchResult::Found`].
+    const FOUND: u8 = 0;
+    /// Wire tag for [`BatchResult::Unknown`].
+    const UNKNOWN: u8 = 1;
+    /// Wire tag for [`BatchResult::Expired`].
+    const EXPIRED: u8 = 2;
+    /// Wire tag for [`BatchResult::Unavailable`].
+    const UNAVAILABLE: u8 = 3;
+}
+
+impl Write for BatchResult {
+    fn write(&self, buf: &mut impl BufMut) {
+        match self {
+            Self::Found { batch, cert } => {
+                Self::FOUND.write(buf);
+                batch.write(buf);
+                cert.write(buf);
+            }
+            Self::Unknown => Self::UNKNOWN.write(buf),
+            Self::Expired => Self::EXPIRED.write(buf),
+            Self::Unavailable => Self::UNAVAILABLE.write(buf),
+        }
+    }
+}
+
+impl EncodeSize for BatchResult {
+    fn encode_size(&self) -> usize {
+        u8::SIZE
+            + match self {
+                Self::Found { batch, cert } => batch.encode_size() + cert.encode_size(),
+                Self::Unknown | Self::Expired | Self::Unavailable => 0,
+            }
+    }
+}
+
+impl Read for BatchResult {
+    /// Number of participants in the signing set, needed to bound the certificate's bitmap.
+    type Cfg = usize;
+
+    fn read_cfg(buf: &mut impl Buf, participants: &usize) -> Result<Self, CodecError> {
+        match u8::read(buf)? {
+            Self::FOUND => Ok(Self::Found {
+                batch: Batch::read(buf)?,
+                cert: Box::new(DaCert::read_cfg(buf, participants)?),
+            }),
+            Self::UNKNOWN => Ok(Self::Unknown),
+            Self::EXPIRED => Ok(Self::Expired),
+            Self::UNAVAILABLE => Ok(Self::Unavailable),
+            _ => Err(CodecError::Invalid("blob::BatchResult", "unknown variant")),
+        }
+    }
+}
+
 /// A validator's reply to a [`ClientRequest`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClientResponse {
     /// The blob was accepted, and this is the identity to poll with.
-    Ack(BlobId),
-    /// Where the blob has got to.
-    Status(BlobStatus),
-    /// The batch bytes, or `None` if the batch is unknown or has aged out of custody.
+    Ack {
+        /// Identity of the accepted blob.
+        id: BlobId,
+    },
+    /// Where the blob has got to, or `None` if this validator has no record of it.
     ///
-    /// The client verifies these bytes itself by re-encoding them and comparing the commitment,
-    /// so a validator that returns the wrong batch gains nothing.
-    Batch(Option<Batch>),
+    /// A validator only knows about blobs submitted to it: a client polling one gateway about a
+    /// blob it gave to another gets `None`, which is also what it gets for a status the board has
+    /// evicted.
+    Status {
+        /// The recorded status, if any.
+        status: Option<BlobStatus>,
+    },
+    /// The batch bytes and the certificate over them, or why neither is on offer.
+    ///
+    /// The client verifies the bytes itself by re-encoding them and comparing the commitment, so
+    /// a validator that returns the wrong batch gains nothing.
+    Batch {
+        /// The outcome of the query.
+        result: BatchResult,
+    },
 }
 
 impl ClientResponse {
@@ -375,17 +466,17 @@ impl ClientResponse {
 impl Write for ClientResponse {
     fn write(&self, buf: &mut impl BufMut) {
         match self {
-            Self::Ack(id) => {
+            Self::Ack { id } => {
                 Self::ACK.write(buf);
                 id.write(buf);
             }
-            Self::Status(status) => {
+            Self::Status { status } => {
                 Self::STATUS.write(buf);
                 status.write(buf);
             }
-            Self::Batch(batch) => {
+            Self::Batch { result } => {
                 Self::BATCH.write(buf);
-                batch.write(buf);
+                result.write(buf);
             }
         }
     }
@@ -395,21 +486,28 @@ impl EncodeSize for ClientResponse {
     fn encode_size(&self) -> usize {
         u8::SIZE
             + match self {
-                Self::Ack(id) => id.encode_size(),
-                Self::Status(status) => status.encode_size(),
-                Self::Batch(batch) => batch.encode_size(),
+                Self::Ack { id } => id.encode_size(),
+                Self::Status { status } => status.encode_size(),
+                Self::Batch { result } => result.encode_size(),
             }
     }
 }
 
 impl Read for ClientResponse {
-    type Cfg = ();
+    /// Number of participants in the signing set, needed to bound a certificate's bitmap.
+    type Cfg = usize;
 
-    fn read_cfg(buf: &mut impl Buf, _: &()) -> Result<Self, CodecError> {
+    fn read_cfg(buf: &mut impl Buf, participants: &usize) -> Result<Self, CodecError> {
         match u8::read(buf)? {
-            Self::ACK => Ok(Self::Ack(BlobId::read(buf)?)),
-            Self::STATUS => Ok(Self::Status(BlobStatus::read(buf)?)),
-            Self::BATCH => Ok(Self::Batch(Option::<Batch>::read_cfg(buf, &())?)),
+            Self::ACK => Ok(Self::Ack {
+                id: BlobId::read(buf)?,
+            }),
+            Self::STATUS => Ok(Self::Status {
+                status: Option::<BlobStatus>::read_cfg(buf, &())?,
+            }),
+            Self::BATCH => Ok(Self::Batch {
+                result: BatchResult::read_cfg(buf, participants)?,
+            }),
             _ => Err(CodecError::Invalid(
                 "blob::ClientResponse",
                 "unknown variant",
@@ -552,7 +650,7 @@ mod tests {
         let payload = Payload {
             parent: sha256::Digest::from([1u8; 32]),
             view: View::new(4),
-            certs: vec![cert.clone(), cert],
+            certs: vec![cert.clone(), cert.clone()],
         };
         let encoded = payload.encode();
         assert_eq!(
@@ -582,19 +680,42 @@ mod tests {
 
         let batch = Batch::new(vec![blob.clone()]).expect("batch is within bounds");
         for response in [
-            ClientResponse::Ack(blob.id()),
-            ClientResponse::Status(BlobStatus::Pending),
-            ClientResponse::Status(BlobStatus::Certified(header.commitment)),
-            ClientResponse::Status(BlobStatus::Included {
-                commitment: header.commitment,
-                view: View::new(8),
-            }),
-            ClientResponse::Status(BlobStatus::Failed),
-            ClientResponse::Batch(None),
-            ClientResponse::Batch(Some(batch)),
+            ClientResponse::Ack { id: blob.id() },
+            ClientResponse::Status { status: None },
+            ClientResponse::Status {
+                status: Some(BlobStatus::Pending),
+            },
+            ClientResponse::Status {
+                status: Some(BlobStatus::Certified(header.commitment)),
+            },
+            ClientResponse::Status {
+                status: Some(BlobStatus::Included {
+                    commitment: header.commitment,
+                    view: View::new(8),
+                }),
+            },
+            ClientResponse::Status {
+                status: Some(BlobStatus::Failed),
+            },
+            ClientResponse::Batch {
+                result: BatchResult::Unknown,
+            },
+            ClientResponse::Batch {
+                result: BatchResult::Expired,
+            },
+            ClientResponse::Batch {
+                result: BatchResult::Unavailable,
+            },
+            ClientResponse::Batch {
+                result: BatchResult::Found {
+                    batch,
+                    cert: Box::new(cert),
+                },
+            },
         ] {
             assert_eq!(
-                ClientResponse::decode(response.encode()).expect("client response decodes"),
+                ClientResponse::decode_cfg(response.encode(), &(PARTICIPANTS as usize))
+                    .expect("client response decodes"),
                 response
             );
         }
@@ -633,8 +754,9 @@ mod tests {
 
         // Unknown enum tags are rejected rather than defaulted.
         assert!(ClientRequest::decode([9u8].as_slice()).is_err());
-        assert!(ClientResponse::decode([9u8].as_slice()).is_err());
+        assert!(ClientResponse::decode_cfg([9u8].as_slice(), &(PARTICIPANTS as usize)).is_err());
         assert!(BlobStatus::decode([9u8].as_slice()).is_err());
+        assert!(BatchResult::decode_cfg([9u8].as_slice(), &(PARTICIPANTS as usize)).is_err());
 
         // A payload claiming more certificates than the wire bound is rejected on the count.
         let mut over = Vec::new();

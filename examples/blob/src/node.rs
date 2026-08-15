@@ -31,8 +31,10 @@ use crate::{
     constants::{
         ATTEST_SLACK, CERTIFICATION_TIMEOUT, CERTIFICATION_TIMEOUT_SIM, FETCH_TIMEOUT,
         FETCH_TIMEOUT_SIM, LEADER_TIMEOUT, LEADER_TIMEOUT_SIM, MAX_TRACKED_BLOBS, PAYLOAD_DEQUE,
-        SKIP_TIMEOUT, SKIP_TIMEOUT_SIM, STATUS_TTL, TIMEOUT_RETRY, TIMEOUT_RETRY_SIM,
-        VIEW_RETENTION, consensus_namespace,
+        RETRIEVAL_TIMEOUT, RETRIEVAL_TIMEOUT_SIM, SHARD_FETCH_INITIAL, SHARD_FETCH_RETRY,
+        SHARD_FETCH_RETRY_SIM, SHARD_FETCH_TIMEOUT, SHARD_FETCH_TIMEOUT_SIM, SKIP_TIMEOUT,
+        SKIP_TIMEOUT_SIM, STATUS_TTL, TIMEOUT_RETRY, TIMEOUT_RETRY_SIM, VIEW_RETENTION,
+        consensus_namespace,
     },
     custody::{self, Custody},
     gateway::{
@@ -41,6 +43,9 @@ use crate::{
         disperser::{self},
     },
     payload::{self, PayloadStore},
+    registry::Registry,
+    retrieval::{self, Coordinator},
+    rpc,
     types::Scheme,
     wire::DisperseRequest,
 };
@@ -61,6 +66,7 @@ use commonware_cryptography::{
 };
 use commonware_p2p::{Blocker, Provider, Receiver, Sender};
 use commonware_parallel::Strategy;
+use commonware_resolver::p2p as resolver;
 use commonware_runtime::{BufferPooler, Clock, Metrics, Spawner, Storage, buffer::paged::CacheRef};
 use commonware_utils::{NZU16, NZUsize, channel::mpsc, ordered::BiMap};
 use rand_core::CryptoRng;
@@ -124,6 +130,12 @@ pub struct Timing {
     pub skip: Duration,
     /// Views below the finalized tip consensus keeps.
     pub retention: ViewDelta,
+    /// How long a retrieval may take before it is abandoned.
+    pub retrieval: Duration,
+    /// How long one shard request waits on one custodian.
+    pub shard: Duration,
+    /// How long a shard request waits in the resolver's queue before it is retried.
+    pub shard_retry: Duration,
 }
 
 impl Timing {
@@ -138,6 +150,9 @@ impl Timing {
             fetch: FETCH_TIMEOUT,
             skip: SKIP_TIMEOUT,
             retention: VIEW_RETENTION,
+            retrieval: RETRIEVAL_TIMEOUT,
+            shard: SHARD_FETCH_TIMEOUT,
+            shard_retry: SHARD_FETCH_RETRY,
         }
     }
 
@@ -152,6 +167,9 @@ impl Timing {
             fetch: FETCH_TIMEOUT_SIM,
             skip: SKIP_TIMEOUT_SIM,
             retention: VIEW_RETENTION,
+            retrieval: RETRIEVAL_TIMEOUT_SIM,
+            shard: SHARD_FETCH_TIMEOUT_SIM,
+            shard_retry: SHARD_FETCH_RETRY_SIM,
         }
     }
 }
@@ -202,6 +220,10 @@ pub struct Channels<S, R> {
     pub cert_gossip: (S, R),
     /// Consensus payloads, which bare simplex does not disseminate itself.
     pub payload_gossip: (S, R),
+    /// Shard requests and the shards that answer them.
+    pub retrieval: (S, R),
+    /// Client submissions, status polls, and batch queries.
+    pub client_rpc: (S, R),
 }
 
 /// A running validator.
@@ -217,6 +239,10 @@ pub struct Node<E: Clock + Metrics + Spawner> {
     pub application: application::Mailbox,
     /// The attestor, which owns this node's custody.
     pub attestor: attestor::Mailbox,
+    /// Certificates this node has seen finalized, and the read path's entry point.
+    pub registry: Registry,
+    /// The retrieval coordinator, which gathers a batch from its custodians.
+    pub retrieval: retrieval::Mailbox,
     /// The last finalized view, shared by everything that has a floor.
     pub watermark: Watermark,
     /// A live handle on the dispersal engine.
@@ -261,6 +287,7 @@ where
     .ok_or(Error::Stranger)?;
 
     let watermark = Watermark::default();
+    let registry = Registry::new();
     let board = StatusBoard::new(
         context.child("status"),
         NZUsize!(MAX_TRACKED_BLOBS),
@@ -298,7 +325,7 @@ where
             handler: attestor_mailbox.clone(),
             mailbox_size: config.mailbox_size,
             priority_request: false,
-            request_codec: config.shard,
+            request_codec: config.shard.clone(),
             priority_response: false,
             response_codec: (),
         },
@@ -314,7 +341,7 @@ where
             deque_size: PAYLOAD_DEQUE,
             priority: false,
             codec_config: participants,
-            peer_provider: config.peers,
+            peer_provider: config.peers.clone(),
         },
     );
     payload_gossip.start(channels.payload_gossip);
@@ -334,6 +361,7 @@ where
             store,
             payloads,
             board: board.clone(),
+            registry: registry.clone(),
             watermark: watermark.clone(),
             attestor: attestor_mailbox.clone(),
             mailbox_size: config.mailbox_size,
@@ -341,6 +369,45 @@ where
         },
     );
     application.start(channels.cert_gossip);
+
+    // The read path. Its engine needs the consumer that feeds the coordinator before it yields
+    // the handle the coordinator fetches through, so the mailbox is built ahead of both, exactly
+    // as the dispersal engine's is.
+    let (retrieval_mailbox, consumer, shard_inbox) =
+        retrieval::mailbox(&context.child("retrieval"), config.mailbox_size);
+    let (shards, resolver_mailbox) = resolver::Engine::new(
+        context.child("shards"),
+        resolver::Config {
+            peer_provider: config.peers,
+            blocker: config.blocker.clone(),
+            consumer,
+            producer: retrieval::Producer::new(context.child("producer"), attestor_mailbox.clone()),
+            mailbox_size: config.mailbox_size,
+            me: Some(me.clone()),
+            initial: SHARD_FETCH_INITIAL,
+            timeout: config.timing.shard,
+            fetch_retry_timeout: config.timing.shard_retry,
+            priority_requests: false,
+            priority_responses: false,
+        },
+    );
+    shards.start(channels.retrieval);
+    Coordinator::new(
+        context.child("retrieval"),
+        retrieval::Config {
+            scheme: attesting.clone(),
+            namespace: config.namespace.clone(),
+            registry: registry.clone(),
+            attestor: attestor_mailbox.clone(),
+            shard: config.shard,
+            timeout: config.timing.retrieval,
+            mailbox_size: config.mailbox_size,
+            strategy: config.strategy.clone(),
+        },
+        shard_inbox,
+        resolver_mailbox,
+    )
+    .start();
 
     // The gateway: intake feeds dispersal over a bounded queue, and dispersal hands what it
     // certifies to the application, which pools it and puts it on the wire.
@@ -380,6 +447,19 @@ where
     )
     .start();
 
+    // What clients talk to. Nothing behind it is trusted by them: an acknowledgement names a
+    // blob they can rehash, and a batch comes with the certificate they check it against.
+    rpc::Server::new(
+        context.child("rpc"),
+        rpc::Config {
+            batcher: submit.clone(),
+            board: board.clone(),
+            registry: registry.clone(),
+            retrieval: retrieval_mailbox.clone(),
+        },
+    )
+    .start(channels.client_rpc);
+
     // Consensus. The floor is the genesis payload's digest: every ancestry walk ends there, so
     // every chain starts there.
     let engine = simplex::Engine::new(
@@ -416,6 +496,8 @@ where
         board,
         application: mailbox,
         attestor: attestor_mailbox,
+        registry,
+        retrieval: retrieval_mailbox,
         watermark,
         _originator: originator,
     })
@@ -427,9 +509,9 @@ mod tests {
     use crate::{
         constants::{
             BATCH_TARGET_SIM, BATCH_TIMEOUT_SIM, CERT_GOSSIP_CHANNEL, CERTIFICATE_CHANNEL,
-            DISPERSE_REQ_CHANNEL, DISPERSE_RES_CHANNEL, DISPERSE_TIMEOUT_SIM,
+            CLIENT_RPC_CHANNEL, DISPERSE_REQ_CHANNEL, DISPERSE_RES_CHANNEL, DISPERSE_TIMEOUT_SIM,
             MAX_DISPERSAL_ATTEMPTS, NAMESPACE, PAYLOAD_GOSSIP_CHANNEL, RESOLVER_CHANNEL,
-            VOTE_CHANNEL,
+            RETRIEVAL_CHANNEL, VOTE_CHANNEL,
         },
         poseidon2::Fr,
         test_util::{self, Keys},
@@ -492,6 +574,8 @@ mod tests {
             disperse_res: test_util::register(oracle, peer, DISPERSE_RES_CHANNEL).await,
             cert_gossip: test_util::register(oracle, peer, CERT_GOSSIP_CHANNEL).await,
             payload_gossip: test_util::register(oracle, peer, PAYLOAD_GOSSIP_CHANNEL).await,
+            retrieval: test_util::register(oracle, peer, RETRIEVAL_CHANNEL).await,
+            client_rpc: test_util::register(oracle, peer, CLIENT_RPC_CHANNEL).await,
         }
     }
 

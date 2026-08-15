@@ -21,6 +21,7 @@ mod application;
 mod assignment;
 mod attestor;
 mod blob_tree;
+mod client;
 mod constants;
 mod custody;
 mod gateway;
@@ -29,6 +30,9 @@ mod measure;
 mod node;
 mod payload;
 mod poseidon2;
+mod registry;
+mod retrieval;
+mod rpc;
 #[cfg(test)]
 mod test_util;
 mod types;

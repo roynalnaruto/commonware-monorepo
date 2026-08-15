@@ -82,14 +82,14 @@ pub const CERT_GOSSIP_CHANNEL: u64 = 6;
 /// Gossip of consensus payloads, which bare simplex does not disseminate itself.
 pub const PAYLOAD_GOSSIP_CHANNEL: u64 = 7;
 
-/// Shard retrieval requests.
-pub const RETRIEVAL_REQ_CHANNEL: u64 = 8;
+/// Shard retrieval, requests and responses alike.
+///
+/// One channel rather than two: the resolver that carries retrieval tags every message with the
+/// request it belongs to, so both directions share a codec and a channel.
+pub const RETRIEVAL_CHANNEL: u64 = 8;
 
-/// Shard retrieval responses.
-pub const RETRIEVAL_RES_CHANNEL: u64 = 9;
-
-/// Client status and batch queries.
-pub const CLIENT_RPC_CHANNEL: u64 = 10;
+/// Client submissions, status polls, and batch queries, in both directions.
+pub const CLIENT_RPC_CHANNEL: u64 = 9;
 
 /// Bytes per page of a blob, the unit of the page tree and of an in-circuit opening.
 pub const BLOB_PAGE: usize = 4096;
@@ -177,6 +177,54 @@ pub const MAX_TRACKED_BLOBS: usize = 4096;
 /// A client that never polls should not pin an entry forever. Long enough that a client which
 /// polls at any sensible interval still sees the outcome of its submission.
 pub const STATUS_TTL: Duration = Duration::from_secs(300);
+
+/// How long a retrieval waits for enough shards before it gives up.
+///
+/// Covers a whole gather: `minimum_shards` round trips to custodians that may each be slow,
+/// followed by a decode measured at roughly 450 ms for an 8 MiB batch. What it bounds is the
+/// client's wait, so it is generous rather than tight; a retrieval that fails is reported as a
+/// timeout rather than left hanging.
+pub const RETRIEVAL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Retrieval deadline in simulated tests.
+pub const RETRIEVAL_TIMEOUT_SIM: Duration = Duration::from_secs(2);
+
+/// How long one shard request waits on one custodian before the resolver tries again.
+///
+/// Well inside [`RETRIEVAL_TIMEOUT`], so a custodian that never answers costs the gather a retry
+/// rather than the whole deadline. Fetches are targeted at a single custodian each, so a retry
+/// goes back to the same peer: the shard exists nowhere else.
+pub const SHARD_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Shard request timer in simulated tests.
+pub const SHARD_FETCH_TIMEOUT_SIM: Duration = Duration::from_millis(400);
+
+/// How long a shard request waits in the resolver's queue before it is retried.
+pub const SHARD_FETCH_RETRY: Duration = Duration::from_secs(2);
+
+/// Shard retry timer in simulated tests.
+pub const SHARD_FETCH_RETRY_SIM: Duration = Duration::from_millis(200);
+
+/// Performance the resolver assumes of a custodian it has never fetched from.
+pub const SHARD_FETCH_INITIAL: Duration = Duration::from_millis(500);
+
+/// How long a client waits for a validator to answer one request.
+///
+/// Longer than [`RETRIEVAL_TIMEOUT`], because a validator answering a batch query is itself
+/// waiting on a gather: a client that gave up first would never see the timeout reported.
+pub const CLIENT_TIMEOUT: Duration = Duration::from_secs(35);
+
+/// Client request timer in simulated tests.
+pub const CLIENT_TIMEOUT_SIM: Duration = Duration::from_secs(4);
+
+/// Commitments the certificate registry remembers as expired.
+///
+/// Once a batch passes its retrievability horizon the registry drops the certificate but keeps the
+/// commitment, so a client asking for it is told the batch expired rather than that it never
+/// existed. Only the commitment is kept, and only the most recent ones: past this bound the oldest
+/// is forgotten and the answer degrades to "unknown", which is what a node that never saw the
+/// certificate would have said anyway.
+pub const MAX_EXPIRED_CERTS: usize = 4096;
 
 /// Maximum number of views a certificate may age between dispersal and inclusion.
 ///
@@ -278,6 +326,15 @@ mod tests {
             assert!(SKIP_TIMEOUT_SIM.as_nanos() > CERTIFICATION_TIMEOUT_SIM.as_nanos());
             assert!(SKIP_TIMEOUT_SIM.as_nanos() > TIMEOUT_RETRY_SIM.as_nanos());
             assert!(LEADER_TIMEOUT_SIM.as_nanos() < LEADER_TIMEOUT.as_nanos());
+            // A retrieval outlasts the shard requests it is made of, and a client outlasts the
+            // retrieval it is waiting on: whoever gives up first hides the other's verdict.
+            assert!(RETRIEVAL_TIMEOUT.as_nanos() > SHARD_FETCH_TIMEOUT.as_nanos());
+            assert!(RETRIEVAL_TIMEOUT_SIM.as_nanos() > SHARD_FETCH_TIMEOUT_SIM.as_nanos());
+            assert!(CLIENT_TIMEOUT.as_nanos() > RETRIEVAL_TIMEOUT.as_nanos());
+            assert!(CLIENT_TIMEOUT_SIM.as_nanos() > RETRIEVAL_TIMEOUT_SIM.as_nanos());
+            assert!(RETRIEVAL_TIMEOUT_SIM.as_nanos() < RETRIEVAL_TIMEOUT.as_nanos());
+            assert!(SHARD_FETCH_RETRY_SIM.as_nanos() < SHARD_FETCH_RETRY.as_nanos());
+            assert!(MAX_EXPIRED_CERTS > 0);
         }
     }
 

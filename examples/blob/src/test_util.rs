@@ -92,11 +92,7 @@ pub fn dispersal_among(
     filler: u8,
 ) -> (BatchHeader, Vec<StrongShard>) {
     let config = coding_config(participants).expect("participant set can be coded");
-    let batch = Batch::new(vec![
-        Blob::new(Bytes::from(vec![filler; 4096])).expect("blob is within bounds"),
-        Blob::new(Bytes::from(vec![filler ^ 0xff; 1024])).expect("blob is within bounds"),
-    ])
-    .expect("batch is within bounds");
+    let batch = sample_batch(filler);
     let (commitment, shards) = Coder::encode(
         &coding_namespace(NAMESPACE),
         &config,
@@ -108,6 +104,15 @@ pub fn dispersal_among(
         BatchHeader::new(commitment, config, View::new(view)),
         shards,
     )
+}
+
+/// The batch [`dispersal`] and [`dispersal_among`] encode, so a reader can compare against it.
+pub fn sample_batch(filler: u8) -> Batch {
+    Batch::new(vec![
+        Blob::new(Bytes::from(vec![filler; 4096])).expect("blob is within bounds"),
+        Blob::new(Bytes::from(vec![filler ^ 0xff; 1024])).expect("blob is within bounds"),
+    ])
+    .expect("batch is within bounds")
 }
 
 /// Attestations a certificate needs in the simulated deployment: `2f + 1`.
@@ -145,6 +150,19 @@ pub async fn network(
     context: &deterministic::Context,
     peers: &[ed25519::PublicKey],
 ) -> Oracle<ed25519::PublicKey, deterministic::Context> {
+    network_linked(context, peers, |_, _| LINK.clone()).await
+}
+
+/// Starts a fully connected simulated network whose links are chosen per ordered pair.
+///
+/// `link` is given the positions of the sender and the receiver. Tests that need one peer's
+/// answer to arrive before another's use this to say so, rather than relying on the order the
+/// runtime happens to poll in.
+pub async fn network_linked(
+    context: &deterministic::Context,
+    peers: &[ed25519::PublicKey],
+    link: impl Fn(usize, usize) -> Link,
+) -> Oracle<ed25519::PublicKey, deterministic::Context> {
     let (network, oracle) = Network::new(
         context.child("network"),
         commonware_p2p::simulated::Config {
@@ -155,11 +173,11 @@ pub async fn network(
         },
     );
     network.start();
-    for from in peers {
-        for to in peers {
+    for (from, sender) in peers.iter().enumerate() {
+        for (to, receiver) in peers.iter().enumerate() {
             if from != to {
                 oracle
-                    .add_link(from.clone(), to.clone(), LINK.clone())
+                    .add_link(sender.clone(), receiver.clone(), link(from, to))
                     .await
                     .expect("link is added");
             }
@@ -479,4 +497,117 @@ pub fn corrupt(shard: &StrongShard) -> StrongShard {
         }
     }
     panic!("no byte of the shard could be flipped");
+}
+
+/// How a validator answers shard requests in a retrieval test.
+///
+/// One producer type for all of them, because a resolver engine is generic over its producer and
+/// a deployment of mixed behaviours would otherwise be a deployment of mixed engine types.
+pub enum Role<E: commonware_runtime::Metrics + commonware_runtime::Spawner> {
+    /// The real producer: serves whatever this node custodies.
+    Honest(crate::retrieval::Producer<E>),
+    /// Hears every request and answers none.
+    ///
+    /// Indistinguishable from a crashed custodian or one whose shard has expired.
+    Silent,
+    /// Answers every request with the same fixed bytes, whatever was asked for.
+    Forged(Bytes),
+}
+
+impl<E: commonware_runtime::Metrics + commonware_runtime::Spawner> Clone for Role<E> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Honest(producer) => Self::Honest(producer.clone()),
+            Self::Silent => Self::Silent,
+            Self::Forged(bytes) => Self::Forged(bytes.clone()),
+        }
+    }
+}
+
+/// A [`Role`] that also counts the requests it was asked to serve.
+///
+/// The count is what makes cancellation observable: a request the resolver has given up on is a
+/// request that never arrives, so a counter that stops growing is a fetch that stopped.
+pub struct Serve<E: commonware_runtime::Metrics + commonware_runtime::Spawner> {
+    role: Role<E>,
+    requests: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl<E: commonware_runtime::Metrics + commonware_runtime::Spawner> Clone for Serve<E> {
+    fn clone(&self) -> Self {
+        Self {
+            role: self.role.clone(),
+            requests: self.requests.clone(),
+        }
+    }
+}
+
+impl<E: commonware_runtime::Metrics + commonware_runtime::Spawner> Serve<E> {
+    /// Wraps a role.
+    pub fn new(role: Role<E>) -> Self {
+        Self {
+            role,
+            requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    /// Returns how many requests this producer has been asked to serve.
+    pub fn requests(&self) -> usize {
+        self.requests.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl<E: commonware_runtime::Metrics + commonware_runtime::Spawner>
+    commonware_resolver::p2p::Producer for Serve<E>
+{
+    type Key = crate::retrieval::ShardKey;
+
+    fn produce(&mut self, key: Self::Key) -> oneshot::Receiver<Bytes> {
+        self.requests
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        match &mut self.role {
+            Role::Honest(producer) => commonware_resolver::p2p::Producer::produce(producer, key),
+            Role::Silent => oneshot::channel().1,
+            Role::Forged(bytes) => {
+                let (sender, receiver) = oneshot::channel();
+                let _ = sender.send(bytes.clone());
+                receiver
+            }
+        }
+    }
+}
+
+/// A [`commonware_p2p::Blocker`] that records who it was asked to block.
+#[derive(Clone)]
+pub struct Watcher<B: commonware_p2p::Blocker> {
+    inner: B,
+    blocked: Arc<Mutex<Vec<B::PublicKey>>>,
+}
+
+impl<B: commonware_p2p::Blocker> Watcher<B> {
+    /// Wraps a blocker.
+    pub fn new(inner: B) -> Self {
+        Self {
+            inner,
+            blocked: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Returns everyone this node has blocked, in order.
+    pub fn blocked(&self) -> Vec<B::PublicKey> {
+        self.blocked.lock().clone()
+    }
+}
+
+impl<B: commonware_p2p::Blocker> commonware_p2p::Blocker for Watcher<B> {
+    type PublicKey = B::PublicKey;
+
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "forwards a block another actor already decided on and logged"
+    )]
+    fn block(&mut self, peer: Self::PublicKey) -> Feedback {
+        self.blocked.lock().push(peer.clone());
+        self.inner.block(peer)
+    }
 }

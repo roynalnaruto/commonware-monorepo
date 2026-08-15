@@ -10,6 +10,7 @@ use crate::{
     constants::{FRESHNESS, MAX_POOL_CERTS, PAYLOAD_MAX_CERTS},
     gateway::StatusBoard,
     payload::{self, PayloadStore},
+    registry::Registry,
     types::{DaCert, Scheme},
     wire::Payload,
 };
@@ -163,6 +164,8 @@ pub struct Config<E: BufferPooler + Clock + Metrics + Spawner + Storage, T: Stra
     pub payloads: buffered::Mailbox<ed25519::PublicKey, Payload>,
     /// Where the fate of each blob is recorded.
     pub board: StatusBoard<E>,
+    /// Where finalized certificates are recorded for the read path.
+    pub registry: Registry,
     /// The last finalized view, shared with the attestor and the batcher.
     pub watermark: Watermark,
     /// The attestor, which owns custody and therefore its expiry.
@@ -185,6 +188,7 @@ pub struct Application<
     store: PayloadStore<E>,
     payloads: buffered::Mailbox<ed25519::PublicKey, Payload>,
     board: StatusBoard<E>,
+    registry: Registry,
     watermark: Watermark,
     attestor: attestor::Mailbox,
     strategy: T,
@@ -217,6 +221,7 @@ impl<E: BufferPooler + Clock + CryptoRng + Metrics + Spawner + Storage, T: Strat
                 store: config.store,
                 payloads: config.payloads,
                 board: config.board,
+                registry: config.registry,
                 watermark: config.watermark,
                 attestor: config.attestor,
                 strategy: config.strategy,
@@ -400,10 +405,15 @@ impl<E: BufferPooler + Clock + CryptoRng + Metrics + Spawner + Storage, T: Strat
                 self.tip = payload;
                 self.watermark.set(view);
 
-                // A certificate on the finalized chain is spent: it can never be included again,
-                // and the blobs behind it have reached the end of the rail.
+                // A certificate on the finalized chain is spent for consensus and born for
+                // retrieval: it can never be included again, the blobs behind it have reached the
+                // end of the write path, and the registry is now the only place the read path can
+                // learn who custodies the batch. Recording happens before any floor moves, so
+                // nothing is pruned out from under a reader that arrives in the same view.
                 if let Some(finalized) = self.store.get(&payload) {
-                    for commitment in finalized.commitments() {
+                    for cert in &finalized.certs {
+                        let commitment = cert.header.commitment;
+                        self.registry.record(cert.clone(), view);
                         self.pool.remove(&commitment);
                         self.board.included(&commitment, view);
                     }
@@ -431,6 +441,7 @@ impl<E: BufferPooler + Clock + CryptoRng + Metrics + Spawner + Storage, T: Strat
                 // would let a fork that loses discard data the surviving fork still owes.
                 self.store.prune(view).await?;
                 self.attestor.prune(view);
+                self.registry.prune(view);
             }
             Message::Held { digest, response } => {
                 let _ = response.send(self.store.get(&digest));
@@ -745,6 +756,7 @@ mod tests {
             NZUsize!(MAX_TRACKED_BLOBS),
             STATUS_TTL,
         );
+        let registry = Registry::new();
         let (application, app, reporter) = Application::new(
             node.child("application"),
             Config {
@@ -753,6 +765,7 @@ mod tests {
                 store,
                 payloads,
                 board: board.clone(),
+                registry: registry.clone(),
                 watermark: watermark.clone(),
                 attestor: attestor_mailbox,
                 mailbox_size: MAILBOX,
