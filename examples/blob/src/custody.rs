@@ -16,7 +16,7 @@
 //! attest to a shard it may not actually hold.
 
 use crate::{
-    constants::{FRESHNESS, WINDOW},
+    constants::{FRESHNESS, ITEMS_PER_SECTION, WINDOW},
     wire::StrongShard,
 };
 use bytes::{Buf, BufMut};
@@ -32,11 +32,8 @@ use commonware_storage::{
     },
     translator::TwoCap,
 };
-use commonware_utils::{NZU16, NZU64, NZUsize};
-use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
-
-/// Views per prunable section, the granularity at which custody expires.
-const ITEMS_PER_SECTION: NonZeroU64 = NZU64!(10);
+use commonware_utils::{NZU16, NZUsize};
+use std::num::{NonZeroU16, NonZeroUsize};
 
 /// Page size of the key journal's cache.
 const PAGE_SIZE: NonZeroU16 = NZU16!(1024);
@@ -102,6 +99,8 @@ impl Read for CustodyRecord {
 /// means.
 pub struct Custody<E: BufferPooler + Metrics + Storage> {
     archive: Option<Archive<TwoCap, E, Summary, CustodyRecord>>,
+    /// Section the last prune reached, so a floor that has not left it costs nothing.
+    pruned: Option<u64>,
 }
 
 impl<E: BufferPooler + Metrics + Storage> Custody<E> {
@@ -123,6 +122,7 @@ impl<E: BufferPooler + Metrics + Storage> Custody<E> {
         };
         Ok(Self {
             archive: Some(Archive::init(context, cfg).await?),
+            pruned: None,
         })
     }
 
@@ -179,10 +179,20 @@ impl<E: BufferPooler + Metrics + Storage> Custody<E> {
     /// `WINDOW` views after that, so nothing dispersed before `finalized - FRESHNESS - WINDOW` can
     /// still be owed to anyone. The floor saturates at view zero, which makes pruning a young
     /// chain a no-op.
+    ///
+    /// Called on every finalization, but only acted on when the floor crosses a section boundary.
+    /// The archive prunes whole sections, so a floor that has moved within one would drop nothing;
+    /// skipping it turns a per-view scan into per-[`ITEMS_PER_SECTION`] work with no change to
+    /// what is kept.
     pub async fn prune(&mut self, finalized: View) -> Result<(), Error> {
         let floor = finalized.saturating_sub(FRESHNESS).saturating_sub(WINDOW);
+        let section = floor.get() / ITEMS_PER_SECTION.get();
+        if self.pruned == Some(section) {
+            return Ok(());
+        }
         let archive = self.archive.take().ok_or(Error::Poisoned)?;
         self.archive = Some(archive.prune(floor.get()).await?);
+        self.pruned = Some(section);
         Ok(())
     }
 }

@@ -24,7 +24,7 @@
 //! the certificate would have said.
 
 use crate::{
-    constants::{FRESHNESS, MAX_EXPIRED_CERTS, WINDOW},
+    constants::{FRESHNESS, ITEMS_PER_SECTION, MAX_EXPIRED_CERTS, WINDOW},
     types::DaCert,
 };
 use commonware_consensus::types::View;
@@ -64,6 +64,8 @@ struct State {
     /// Commitments whose batches have expired, and the order they expired in.
     expired: HashSet<Summary>,
     order: VecDeque<Summary>,
+    /// Section the last expiry reached, so a floor that has not left it costs nothing.
+    pruned: Option<u64>,
 }
 
 /// The finalized-certificate registry.
@@ -88,6 +90,7 @@ impl Registry {
                 live: HashMap::new(),
                 expired: HashSet::new(),
                 order: VecDeque::new(),
+                pruned: None,
             })),
         }
     }
@@ -134,17 +137,29 @@ impl Registry {
 
     /// Expires every certificate whose batch can no longer be owed to anyone.
     ///
-    /// The floor is custody's: a certificate dispersed at `D` is includable until `D + FRESHNESS`
-    /// and retrievable for `WINDOW` views after that. Expiring on the same rule rather than a
-    /// looser one is what keeps the answer honest: a registry that outlived custody would promise
-    /// batches no validator still holds.
+    /// The floor is custody's, down to the same rounding: a certificate dispersed at `D` is
+    /// includable until `D + FRESHNESS` and retrievable for `WINDOW` views after that, and custody
+    /// drops whole sections, so the floor is rounded down to a section boundary here too. Both
+    /// halves of that matter. Expiring on the same rule rather than a looser one is what keeps the
+    /// answer honest, because a registry that outlived custody would promise batches no validator
+    /// still holds; rounding the same way is what stops it from disowning batches whose shards are
+    /// still on disk.
+    ///
+    /// Called on every finalization, and a scan only happens when the floor crosses a boundary:
+    /// within one section there is nothing new to expire.
     pub fn prune(&self, finalized: View) {
         let floor = finalized.saturating_sub(FRESHNESS).saturating_sub(WINDOW);
+        let section = floor.get() / ITEMS_PER_SECTION.get();
         let mut state = self.state.lock();
+        if state.pruned == Some(section) {
+            return;
+        }
+        state.pruned = Some(section);
+        let floor = section * ITEMS_PER_SECTION.get();
         let stale: Vec<Summary> = state
             .live
             .iter()
-            .filter(|(_, record)| record.cert.header.dispersal_view < floor)
+            .filter(|(_, record)| record.cert.header.dispersal_view.get() < floor)
             .map(|(commitment, _)| *commitment)
             .collect();
         for commitment in stale {
@@ -230,8 +245,22 @@ mod tests {
         registry.prune(View::new(100));
         assert_eq!(registry.len(), 2);
 
-        // Finalizing view 110 puts the floor at 14, past the older batch and not the newer one.
-        registry.prune(View::new(110));
+        // Finalizing view 110 puts the raw floor at 14, past the older dispersal -- but only
+        // part-way into the section holding it. Custody drops whole sections, so those shards are
+        // still on disk and the registry still says the batch is live. Every finalization inside
+        // one section is this same no-op.
+        for finalized in [110u64, 111, 115] {
+            registry.prune(View::new(finalized));
+            assert_eq!(registry.len(), 2, "expired inside a section at {finalized}");
+            assert!(matches!(
+                registry.lookup(&old.header.commitment),
+                Lookup::Live { .. }
+            ));
+        }
+
+        // Finalizing view 116 puts the floor a whole section past the older batch, which is when
+        // custody lets go of it too.
+        registry.prune(View::new(116));
         assert_eq!(registry.len(), 1);
         assert_eq!(registry.lookup(&old.header.commitment), Lookup::Expired);
         assert_eq!(registry.get(&old.header.commitment), None);
@@ -245,7 +274,7 @@ mod tests {
         assert_eq!(registry.lookup(&old.header.commitment), Lookup::Expired);
 
         // Past its own horizon the newer one goes the same way, and a young chain prunes nothing.
-        registry.prune(View::new(210));
+        registry.prune(View::new(216));
         assert!(registry.is_empty());
         assert_eq!(registry.lookup(&new.header.commitment), Lookup::Expired);
         registry.prune(View::zero());
@@ -259,11 +288,13 @@ mod tests {
         // More expiries than the tombstone bound, each over its own commitment.
         let overflow = MAX_EXPIRED_CERTS + 8;
         let mut commitments = Vec::with_capacity(overflow);
+        // Each expiry needs its own section: within one the scan is skipped, because there is
+        // nothing new below a floor that has not moved.
         for index in 0..overflow {
             let cert = stub_cert(numbered(index), View::new(1));
             commitments.push(cert.header.commitment);
             registry.record(cert, View::new(2));
-            registry.prune(View::new(200));
+            registry.prune(View::new(200 + index as u64 * ITEMS_PER_SECTION.get()));
         }
         assert!(registry.is_empty());
 

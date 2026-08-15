@@ -26,7 +26,7 @@
 
 use crate::{
     assignment, attestor,
-    constants::coding_namespace,
+    constants::{MAX_CONCURRENT_SHARD_SERVES, coding_namespace},
     custody::CustodyRecord,
     registry::{Lookup, Registry},
     types::{Batch, DaCert, Scheme},
@@ -47,12 +47,23 @@ use commonware_formatting::Hex;
 use commonware_macros::select_loop;
 use commonware_parallel::Strategy;
 use commonware_resolver::{Delivery, Outcome, TargetedResolver};
-use commonware_runtime::{Clock, ContextCell, Handle, Metrics, Spawner, spawn_cell};
-use commonware_utils::{Span, channel::oneshot, vec::NonEmptyVec};
+use commonware_runtime::{
+    Clock, ContextCell, Handle, Metrics, Spawner, spawn_cell,
+    telemetry::metrics::{
+        Counter, MetricsExt as _,
+        status::{self, Status},
+    },
+};
+use commonware_utils::{
+    Span,
+    channel::oneshot,
+    concurrency::{Limiter, Reservation},
+    vec::NonEmptyVec,
+};
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     fmt::{Display, Formatter},
-    num::NonZeroUsize,
+    num::{NonZeroU32, NonZeroUsize},
     sync::Arc,
     time::Duration,
 };
@@ -129,9 +140,13 @@ pub enum Error {
     Timeout,
     /// Enough shards were gathered, but they did not reconstruct a batch.
     ///
-    /// Every shard counted was bound to the commitment, so this should not be reachable; it is
-    /// reported rather than retried because the shards that would be tried again are the ones
-    /// that just failed.
+    /// Two failures share this name, and neither is worth retrying. Reconstruction itself failing
+    /// is unreachable: every shard counted was bound to the commitment by
+    /// [`weaken`](commonware_coding::PhasedScheme::weaken), and `minimum_shards` such shards
+    /// reconstruct the committed bytes or the commitment did not bind them. What is reachable is
+    /// the second step: the committed bytes are whatever the gateway chose to encode, and nothing
+    /// on the write path checks that they parse as a batch. Gathering more shards would only
+    /// reproduce the same bytes.
     #[error("gathered shards did not decode to a batch")]
     Decode,
     /// The coordinator, or work it delegated, stopped before the retrieval finished.
@@ -221,9 +236,21 @@ impl Mailbox {
 /// Custody belongs to the attestor, which is the only writer of it, so serving goes through the
 /// attestor's mailbox rather than through a second handle on the store. The attestor sits on no
 /// consensus path, so the extra hop costs a message and buys a single owner.
+///
+/// # Bounded
+///
+/// How many shards are asked for at once is decided by peers, and each answer is a custody read
+/// and an encode of up to a whole shard. At most [`MAX_CONCURRENT_SHARD_SERVES`] of them run
+/// together; past that a request is answered with nothing, which the resolver reads as "no data
+/// here" and retries later against the same custodian. Shedding is a delay rather than a loss:
+/// the shard exists nowhere else, so nobody else was going to answer instead.
 pub struct Producer<E: Metrics + Spawner> {
     context: Arc<E>,
     attestor: attestor::Mailbox,
+    /// Serves in flight, shared by every clone of this producer.
+    inflight: Arc<Limiter>,
+    /// Serves, by whether they answered, found nothing, or were shed.
+    served: status::Counter,
 }
 
 impl<E: Metrics + Spawner> Clone for Producer<E> {
@@ -231,6 +258,8 @@ impl<E: Metrics + Spawner> Clone for Producer<E> {
         Self {
             context: self.context.clone(),
             attestor: self.attestor.clone(),
+            inflight: self.inflight.clone(),
+            served: self.served.clone(),
         }
     }
 }
@@ -238,9 +267,14 @@ impl<E: Metrics + Spawner> Clone for Producer<E> {
 impl<E: Metrics + Spawner> Producer<E> {
     /// Builds a producer that serves out of `attestor`'s custody.
     pub fn new(context: E, attestor: attestor::Mailbox) -> Self {
+        let served = context.family("served", "Number of shard requests served by outcome");
+        let limit = NonZeroU32::new(MAX_CONCURRENT_SHARD_SERVES as u32)
+            .expect("the serve bound is not zero");
         Self {
             context: Arc::new(context),
             attestor,
+            inflight: Arc::new(Limiter::new(limit)),
+            served,
         }
     }
 }
@@ -250,19 +284,32 @@ impl<E: Metrics + Spawner> commonware_resolver::p2p::Producer for Producer<E> {
 
     fn produce(&mut self, key: Self::Key) -> oneshot::Receiver<Bytes> {
         let (response, receiver) = oneshot::channel();
+        let Some(permit) = self.inflight.try_acquire() else {
+            debug!(%key, "shard serves are at their bound; request shed");
+            self.served.inc(Status::Dropped);
+            return receiver;
+        };
         let attestor = self.attestor.clone();
+        let served = self.served.clone();
         self.context.child("serve").spawn(move |_| async move {
+            // Held for the whole answer, so the bound counts work in flight rather than requests
+            // accepted.
+            let _permit: Reservation = permit;
+
             // Dropping the responder is how "I do not have this" is said: the requester is told
             // there is no data and tries again later, and nobody is blamed for it.
             let Some(record) = attestor.fetch(key.commitment).await else {
                 debug!(%key, "no shard held for this key");
+                served.inc(Status::Failure);
                 return;
             };
             if record.index != key.index {
                 debug!(%key, held = record.index, "held shard is for another index");
+                served.inc(Status::Failure);
                 return;
             }
             let _ = response.send(record.encode());
+            served.inc(Status::Success);
         });
         receiver
     }
@@ -394,6 +441,10 @@ pub struct Coordinator<E: Clock + Metrics + Spawner, R: TargetedResolver, T: Str
     shard: CodecConfig,
     timeout: Duration,
     strategy: T,
+    /// Batches reconstructed, by whether they were returned, timed out, or would not decode.
+    gathered: status::Counter,
+    /// Shards that failed their coding check.
+    invalid: Counter,
     /// This node's own position, whose shard comes from custody rather than the network.
     index: Option<u16>,
     gathers: HashMap<Summary, Gather>,
@@ -411,6 +462,8 @@ where
     /// Builds the coordinator over the receiving half of a [`mailbox()`] pair.
     pub fn new(context: E, config: Config<T>, inbox: Inbox, resolver: R) -> Self {
         let index = assignment::my_index(&config.scheme);
+        let gathered = context.family("gathered", "Number of retrievals by outcome");
+        let invalid = context.counter("invalid", "Number of shards that failed their coding check");
         Self {
             context: ContextCell::new(context),
             coding: coding_namespace(&config.namespace),
@@ -421,6 +474,8 @@ where
             shard: config.shard,
             timeout: config.timeout,
             strategy: config.strategy,
+            gathered,
+            invalid,
             index,
             gathers: HashMap::new(),
             next: 0,
@@ -688,6 +743,7 @@ where
         }
         let Some(checked) = checked else {
             debug!(?commitment, index, "shard failed its coding check");
+            self.invalid.inc();
             return;
         };
         let (checking, shard) = *checked;
@@ -735,7 +791,9 @@ where
             return;
         }
         // The batch is self-describing: the decoded bytes alone carry every blob, which is what
-        // lets a reader rederive identities and the blob tree without asking the gateway.
+        // lets a reader rederive identities and the blob tree without asking the gateway. It is
+        // also where a gateway that certified bytes which are not a batch is found out, and the
+        // gather is retired rather than reopened: see [`Error::Decode`].
         let result = bytes.map_or(Err(Error::Decode), |bytes| {
             Batch::decode(bytes.as_slice()).map_err(|err| {
                 warn!(?commitment, ?err, "decoded bytes are not a batch");
@@ -750,6 +808,11 @@ where
         let Some(gather) = self.gathers.remove(commitment) else {
             return;
         };
+        self.gathered.inc(match result {
+            Ok(_) => Status::Success,
+            Err(Error::Timeout) => Status::Timeout,
+            Err(_) => Status::Failure,
+        });
         for waiter in gather.waiters {
             let _ = waiter.send(result.clone().map(|batch| (batch, gather.cert.clone())));
         }
@@ -957,7 +1020,8 @@ mod tests {
             let registry = Registry::new();
             registries.push(registry.clone());
 
-            let (mailbox, consumer, inbox) = mailbox(&node.child("retrieval"), NZUsize!(256));
+            let retrieval_context = node.child("retrieval");
+            let (mailbox, consumer, inbox) = mailbox(&retrieval_context, NZUsize!(256));
             let (engine, resolver) = shards::Engine::new(
                 node.child("shards"),
                 shards::Config {
@@ -1214,6 +1278,126 @@ mod tests {
     }
 
     #[test]
+    fn p6_producer_bounds_concurrent_serves() {
+        runner().start(|context| async move {
+            // An attestor whose actor is never started: its mailbox takes reads and nothing on
+            // the other side completes them, so every serve this producer starts stays in flight.
+            let custody = Custody::init(
+                context.child("custody"),
+                &format!("{PREFIX}-bound"),
+                test_util::shard_cfg(),
+            )
+            .await
+            .expect("custody opens");
+            let fixture = test_util::attesting(&test_util::keys(PARTICIPANTS as usize));
+            let (idle, mailbox) = Attestor::new(
+                context.child("attestor"),
+                crate::attestor::Config {
+                    scheme: fixture.schemes[0].clone(),
+                    namespace: NAMESPACE.to_vec(),
+                    watermark: Watermark::new(View::new(VIEW)),
+                    slack: ATTEST_SLACK,
+                    mailbox_size: NZUsize!(64),
+                },
+                custody,
+            )
+            .expect("attestor builds");
+            let mut producer = Producer::new(context.child("producer"), mailbox);
+
+            // The bound is taken before the work is spawned, so saturating it needs no scheduling
+            // and no clock: the requests are simply outstanding.
+            let commitment = test_util::summary(0x77);
+            let held: Vec<_> = (0..MAX_CONCURRENT_SHARD_SERVES)
+                .map(|index| {
+                    commonware_resolver::p2p::Producer::produce(
+                        &mut producer,
+                        ShardKey::new(commitment, index as u16),
+                    )
+                })
+                .collect();
+
+            // One past it is answered with nothing, which is what the resolver reads as "no data
+            // here" and retries later. Shedding blames nobody and loses nothing.
+            let shed = commonware_resolver::p2p::Producer::produce(
+                &mut producer,
+                ShardKey::new(commitment, MAX_CONCURRENT_SHARD_SERVES as u16),
+            );
+            assert!(
+                shed.await.is_err(),
+                "a request past the bound was taken on anyway"
+            );
+            let encoded = context.encode();
+            assert!(
+                encoded.contains("served_total{status=\"Dropped\"} 1"),
+                "the shed request was not counted:\n{encoded}"
+            );
+
+            // Releasing the outstanding serves lets the next request through, so the bound counts
+            // work in flight rather than requests ever made.
+            drop(idle);
+            for receiver in held {
+                assert!(receiver.await.is_err(), "an idle attestor answered");
+            }
+            context.sleep(Duration::from_millis(10)).await;
+            let after = commonware_resolver::p2p::Producer::produce(
+                &mut producer,
+                ShardKey::new(commitment, 1),
+            );
+            assert!(after.await.is_err(), "an idle attestor answered");
+            let encoded = context.encode();
+            assert!(
+                encoded.contains("served_total{status=\"Dropped\"} 1"),
+                "a request inside the bound was shed:\n{encoded}"
+            );
+        });
+    }
+
+    #[test]
+    fn p6_retrieval_rejects_certified_non_batch() {
+        runner().start(|context| async move {
+            // A gateway chooses what it encodes. Attestors check that a shard belongs to the
+            // commitment and nothing more, so a quorum can certify bytes that are not a batch.
+            let (header, shards) = test_util::dispersal_of(VIEW, Bytes::from(vec![0xffu8; 2048]));
+            let holders: Vec<usize> = (0..QUORUM).collect();
+            let deployment = deploy(
+                &context,
+                &[(&header, &shards)],
+                &holders,
+                &behaviours(&[]),
+                |_, _| LINK.clone(),
+            )
+            .await;
+            let cert = certify(&deployment, &header, QUORUM);
+            deployment.registries[READER].record(cert, View::new(VIEW + 1));
+
+            // Reconstruction succeeds and parsing does not, which is the one way this error is
+            // reachable. It is reported rather than retried: more shards would rebuild the same
+            // bytes.
+            let result = deployment.coordinators[READER]
+                .fetch(header.commitment)
+                .await
+                .expect("coordinator answers");
+            assert_eq!(result.err(), Some(Error::Decode));
+
+            // Nobody is blamed for it. Every custodian served the shard it signed for, so the
+            // fault is the gateway's and it is not a reason to block a peer.
+            assert!(deployment.blockers[READER].blocked().is_empty());
+
+            // And the gather was retired rather than wedged: asking again opens a fresh one and
+            // reaches the same conclusion, instead of attaching to a gather that never ends.
+            assert_eq!(
+                deployment.coordinators[READER]
+                    .fetch(header.commitment)
+                    .await
+                    .expect("coordinator answers")
+                    .err(),
+                Some(Error::Decode),
+                "a second request did not run to its own conclusion"
+            );
+        });
+    }
+
+    #[test]
     fn p5_retrieval_after_expiry_fails_cleanly() {
         runner().start(|context| async move {
             let (header, shards) = test_util::dispersal(VIEW, 0x55);
@@ -1254,9 +1438,24 @@ mod tests {
                 Error::Timeout
             );
 
-            // Past the horizon the registry stops promising it at all, and the answer becomes
-            // immediate: `D + FRESHNESS + WINDOW` for a dispersal at VIEW.
+            // The horizon itself, `D + FRESHNESS + WINDOW`, is not quite the end: custody drops
+            // whole sections and the registry follows it, so a batch part-way into a section is
+            // still promised because its shards are still on disk.
             registry.prune(View::new(VIEW + 32 + 64 + 1));
+            assert_eq!(
+                coordinator
+                    .fetch(header.commitment)
+                    .await
+                    .expect("coordinator answers")
+                    .unwrap_err(),
+                Error::Timeout
+            );
+
+            // A section further on, custody has let go and so has the registry, and the answer
+            // becomes immediate.
+            registry.prune(View::new(
+                VIEW + 32 + 64 + crate::constants::ITEMS_PER_SECTION.get(),
+            ));
             assert_eq!(
                 coordinator
                     .fetch(header.commitment)

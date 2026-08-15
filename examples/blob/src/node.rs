@@ -316,7 +316,8 @@ where
 
     // Dispersal: the engine needs the disperser's monitor before it yields the originator the
     // disperser sends through, so the mailbox is built ahead of both.
-    let (monitor, inbox) = disperser::mailbox(&context.child("disperser"), config.mailbox_size);
+    let disperser_context = context.child("disperser");
+    let (monitor, inbox) = disperser::mailbox(&disperser_context, config.mailbox_size);
     let (dispersal, originator) = collector::Engine::new(
         context.child("collector"),
         collector::Config {
@@ -373,8 +374,9 @@ where
     // The read path. Its engine needs the consumer that feeds the coordinator before it yields
     // the handle the coordinator fetches through, so the mailbox is built ahead of both, exactly
     // as the dispersal engine's is.
+    let retrieval_context = context.child("retrieval");
     let (retrieval_mailbox, consumer, shard_inbox) =
-        retrieval::mailbox(&context.child("retrieval"), config.mailbox_size);
+        retrieval::mailbox(&retrieval_context, config.mailbox_size);
     let (shards, resolver_mailbox) = resolver::Engine::new(
         context.child("shards"),
         resolver::Config {
@@ -507,26 +509,34 @@ where
 mod tests {
     use super::*;
     use crate::{
+        application::Context,
         constants::{
             BATCH_TARGET_SIM, BATCH_TIMEOUT_SIM, CERT_GOSSIP_CHANNEL, CERTIFICATE_CHANNEL,
             CLIENT_RPC_CHANNEL, DISPERSE_REQ_CHANNEL, DISPERSE_RES_CHANNEL, DISPERSE_TIMEOUT_SIM,
             MAX_DISPERSAL_ATTEMPTS, NAMESPACE, PAYLOAD_GOSSIP_CHANNEL, RESOLVER_CHANNEL,
             RETRIEVAL_CHANNEL, VOTE_CHANNEL,
         },
+        custody::CustodyRecord,
         poseidon2::Fr,
         test_util::{self, Keys},
-        types::DaCert,
+        types::{BatchHeader, DaCert},
+        wire::{Payload, StrongShard},
     };
-    use commonware_broadcast::Broadcaster as _;
-    use commonware_consensus::types::View;
-    use commonware_cryptography::{certificate::mocks::Fixture, transcript::Summary};
+    use commonware_broadcast::{Broadcaster as _, buffered};
+    use commonware_consensus::{
+        Automaton as _,
+        types::{Round, View},
+    };
+    use commonware_cryptography::{
+        Digestible as _, certificate::mocks::Fixture, sha256, transcript::Summary,
+    };
     use commonware_p2p::{
         Recipients,
         simulated::{Oracle, Receiver as SimulatedReceiver, Sender as SimulatedSender},
     };
     use commonware_parallel::Sequential;
-    use commonware_runtime::{Runner, Supervisor as _, deterministic};
-    use commonware_utils::{Faults as _, N3f1, NZUsize};
+    use commonware_runtime::{Handle, Runner, Supervisor as _, deterministic};
+    use commonware_utils::{Faults as _, N3f1, NZUsize, channel::oneshot};
 
     /// Validators in the consensus deployment: `n = 5`, `f = 1`, quorum 4, minimum shards 2.
     ///
@@ -657,7 +667,7 @@ mod tests {
 
     /// Returns how many payloads of each node's finalized chain carry `commitment`.
     async fn inclusions(
-        nodes: &[Node<deterministic::Context>],
+        nodes: &[&Node<deterministic::Context>],
         commitment: &Summary,
     ) -> Vec<usize> {
         let mut counts = Vec::new();
@@ -670,6 +680,408 @@ mod tests {
             counts.push(snapshot.inclusions(commitment));
         }
         counts
+    }
+
+    /// Storage partitions of the restart deployment.
+    ///
+    /// A restarted node opens the same partitions under a different metric label, which is the
+    /// whole of what "same node, new process" means here.
+    fn partition(index: usize) -> String {
+        format!("p6-node-{index}")
+    }
+
+    /// The validator that is stopped and restarted.
+    const RESTARTED: usize = 2;
+
+    /// A validator that stays up throughout, and is asked what the chain looks like.
+    const WITNESS: usize = 0;
+
+    /// View both batches claim to have been dispersed at.
+    ///
+    /// Early, because custody has to be seeded before any node opens its store, and inclusion has
+    /// to happen inside the freshness window of it.
+    const DISPERSED: u64 = 1;
+
+    /// Views the chain is left to advance while the node is away the second time.
+    ///
+    /// Long enough that it misses payloads it can never be given: bare simplex backfills none.
+    const OUTAGE: u64 = 12;
+
+    /// A view far above anything this test finalizes.
+    ///
+    /// A verification about a settled view is concluded rather than left open, so a request that
+    /// is meant to stay pending has to be about a view consensus has not reached.
+    const UNREACHED: u64 = 10_000;
+
+    /// A running validator, and the one handle that stops all of it.
+    struct Running {
+        node: Node<deterministic::Context>,
+        /// The task every actor of this node was spawned beneath. Aborting it aborts the subtree,
+        /// which is every task the node owns.
+        handle: Handle<()>,
+    }
+
+    impl Running {
+        /// Stops the node the way a crash does: every task at once, with nothing given a chance
+        /// to flush. What the restart finds is what was already durable.
+        fn stop(self) {
+            self.handle.abort();
+            drop(self.node);
+        }
+    }
+
+    /// Starts one validator beneath a task of its own, under the metric label `role`.
+    ///
+    /// The label is what distinguishes a restarted instance from the one it replaces; the storage
+    /// partition, which is what actually carries state across the restart, is the same either way.
+    async fn spawn_node(
+        context: &deterministic::Context,
+        role: &'static str,
+        index: usize,
+        keys: &Keys,
+        oracle: &Oracle<ed25519::PublicKey, deterministic::Context>,
+    ) -> Running {
+        let peer = keys.privates[index].public_key();
+        let channels = channels(oracle, &peer).await;
+        let config = NodeConfig {
+            signer: keys.privates[index].clone(),
+            bls: keys.bls[index].clone(),
+            participants: keys.participants.clone(),
+            namespace: NAMESPACE.to_vec(),
+            partition: partition(index),
+            blocker: oracle.control(peer.clone()),
+            peers: oracle.manager(),
+            mailbox_size: NZUsize!(256),
+            batch_target: BATCH_TARGET_SIM,
+            attempts: MAX_DISPERSAL_ATTEMPTS,
+            shard: test_util::shard_cfg(),
+            timing: Timing::simulated(BATCH_TIMEOUT_SIM, DISPERSE_TIMEOUT_SIM),
+            strategy: Sequential,
+        };
+        let (ready, started) = oneshot::channel();
+        let handle =
+            context
+                .child(role)
+                .with_attribute("index", index)
+                .spawn(move |context| async move {
+                    let node = start(context.child("node"), config, channels)
+                        .await
+                        .expect("node starts");
+                    let _ = ready.send(node);
+
+                    // Never returns. Every actor was spawned from a context descended from this task,
+                    // so this task's lifetime is the node's lifetime.
+                    std::future::pending::<()>().await
+                });
+        Running {
+            node: started.await.expect("node starts"),
+            handle,
+        }
+    }
+
+    /// Waits until every running node has finalized at least `target`.
+    async fn reach(context: &deterministic::Context, nodes: &[&Running], target: View) {
+        let deadline = context.current() + Duration::from_secs(120);
+        while nodes.iter().any(|node| node.node.watermark.get() < target) {
+            assert!(
+                context.current() < deadline,
+                "consensus stalled below view {}",
+                target.get()
+            );
+            context.sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Asks the node to verify `payload` at `view` over `parent`, without waiting for a verdict.
+    async fn ask(
+        node: &Running,
+        keys: &Keys,
+        view: u64,
+        parent: sha256::Digest,
+        payload: &Payload,
+    ) -> oneshot::Receiver<bool> {
+        let mut mailbox = node.node.application.clone();
+        mailbox
+            .verify(
+                Context {
+                    round: Round::new(Epoch::zero(), View::new(view)),
+                    leader: keys.privates[0].public_key(),
+                    parent: (View::new(view.saturating_sub(1)), parent),
+                },
+                payload.digest(),
+            )
+            .await
+    }
+
+    #[test]
+    fn p6_restart_rebuilds_dedup_and_custody() {
+        runner().start(|context| async move {
+            let keys = test_util::keys(VALIDATORS);
+            let attesting = test_util::attesting(&keys);
+
+            // An extra peer that is no validator. It runs nothing but payload gossip, which is
+            // how a test puts a specific payload in front of a specific node.
+            let observer = ed25519::PrivateKey::from_seed(999).public_key();
+            let mut peers: Vec<ed25519::PublicKey> = keys
+                .privates
+                .iter()
+                .map(|private| private.public_key())
+                .collect();
+            peers.push(observer.clone());
+            let oracle = test_util::network(&context, &peers).await;
+            let (gossip, gossiped) = buffered::Engine::new(
+                context.child("observer"),
+                buffered::Config {
+                    public_key: observer.clone(),
+                    mailbox_size: NZUsize!(256),
+                    deque_size: PAYLOAD_DEQUE,
+                    priority: false,
+                    codec_config: VALIDATORS,
+                    peer_provider: oracle.manager(),
+                },
+            );
+            gossip.start(test_util::register(&oracle, &observer, PAYLOAD_GOSSIP_CHANNEL).await);
+
+            // Two batches this deployment really encoded, and the shard the restarted validator
+            // would have custodied for each. Written before it opens the store, which is exactly
+            // the state a dispersal leaves behind.
+            let batches: Vec<(BatchHeader, Vec<StrongShard>)> = [0xc1u8, 0xc2]
+                .into_iter()
+                .map(|filler| test_util::dispersal_among(VALIDATORS, DISPERSED, filler))
+                .collect();
+            {
+                let mut custody = Custody::init(
+                    context.child("seed"),
+                    &partition(RESTARTED),
+                    test_util::shard_cfg(),
+                )
+                .await
+                .expect("custody opens");
+                for (header, shards) in &batches {
+                    custody
+                        .put(
+                            header.dispersal_view,
+                            header.commitment,
+                            CustodyRecord {
+                                index: RESTARTED as u16,
+                                shard: shards[RESTARTED].clone(),
+                            },
+                        )
+                        .await
+                        .expect("shard stores");
+                }
+            }
+
+            let mut nodes = Vec::new();
+            for index in 0..VALIDATORS {
+                nodes.push(spawn_node(&context, "validator", index, &keys, &oracle).await);
+            }
+            reach(&context, &nodes.iter().collect::<Vec<_>>(), View::new(2)).await;
+
+            // Two certificates a quorum of these validators really attested to, offered to one
+            // node's pool and left to ride into blocks.
+            let quorum = N3f1::quorum(VALIDATORS as u32) as usize;
+            let certs: Vec<DaCert> = batches
+                .iter()
+                .map(|(header, _)| {
+                    test_util::genuine_cert(
+                        &attesting,
+                        header,
+                        &keys.privates[0],
+                        Fr::from(9u64),
+                        quorum,
+                    )
+                })
+                .collect();
+            for cert in &certs {
+                assert!(nodes[INJECTED].node.application.certificate(cert.clone()));
+            }
+            let deadline = View::new(DISPERSED + INCLUSION_BUDGET);
+            loop {
+                let mut carried = 0;
+                for cert in &certs {
+                    let counts = inclusions(
+                        &nodes.iter().map(|node| &node.node).collect::<Vec<_>>(),
+                        &cert.header.commitment,
+                    )
+                    .await;
+                    assert!(counts.iter().all(|count| *count <= 1), "included twice");
+                    carried += usize::from(counts.iter().all(|count| *count == 1));
+                }
+                if carried == certs.len() {
+                    break;
+                }
+                assert!(
+                    nodes
+                        .iter()
+                        .all(|node| node.node.watermark.get() < deadline),
+                    "certificates were not included within {INCLUSION_BUDGET} views"
+                );
+                context.sleep(Duration::from_millis(50)).await;
+            }
+
+            // What the restarted node knew before it stopped: the chain it had finalized, and the
+            // certificates on it.
+            let before = nodes[RESTARTED]
+                .node
+                .application
+                .inspect()
+                .await
+                .expect("application answers");
+            for cert in &certs {
+                assert_eq!(before.inclusions(&cert.header.commitment), 1);
+            }
+
+            // Stop it, and start it again from the same partitions.
+            let stopped = nodes.remove(RESTARTED);
+            let held = stopped.node.attestor.clone();
+            stopped.stop();
+            assert!(
+                held.fetch(batches[0].0.commitment).await.is_none(),
+                "a stopped attestor still answered"
+            );
+            let restarted = spawn_node(&context, "restarted", RESTARTED, &keys, &oracle).await;
+            nodes.insert(RESTARTED, restarted);
+
+            // Custody survived: the shards this validator attested to are still serveable, under
+            // the index it signed for.
+            for (header, shards) in &batches {
+                let record = nodes[RESTARTED]
+                    .node
+                    .attestor
+                    .fetch(header.commitment)
+                    .await
+                    .expect("custody replayed the shard");
+                assert_eq!(record.index, RESTARTED as u16);
+                assert_eq!(record.shard, shards[RESTARTED]);
+            }
+
+            // So did the payload archive, which is where ancestry comes from.
+            assert!(
+                nodes[RESTARTED]
+                    .node
+                    .application
+                    .held(before.tip)
+                    .await
+                    .is_some(),
+                "the payload archive did not replay"
+            );
+
+            // And so did dedup, which is the point of the archive: a certificate already on this
+            // fork is refused at the position it would ride again, and an empty payload at the
+            // same position is not, so the refusal is the duplicate rather than the restart.
+            let view = before.finalized.get() + 1;
+            let dup = Payload {
+                parent: before.tip,
+                view: View::new(view),
+                certs: vec![certs[0].clone()],
+            };
+            let clean = Payload {
+                parent: before.tip,
+                view: View::new(view),
+                certs: Vec::new(),
+            };
+            for payload in [&dup, &clean] {
+                assert!(
+                    gossiped
+                        .broadcast(Recipients::All, (*payload).clone())
+                        .accepted()
+                );
+            }
+            assert!(
+                !ask(&nodes[RESTARTED], &keys, view, before.tip, &dup)
+                    .await
+                    .await
+                    .expect("verification concludes"),
+                "a certificate already on this fork was accepted after the restart"
+            );
+            assert!(
+                ask(&nodes[RESTARTED], &keys, view, before.tip, &clean)
+                    .await
+                    .await
+                    .expect("verification concludes"),
+                "a fresh payload was rejected after the restart"
+            );
+
+            // It is also still part of consensus: every node, this one included, keeps finalizing.
+            let resumed = View::new(nodes[WITNESS].node.watermark.get().get() + 5);
+            reach(&context, &nodes.iter().collect::<Vec<_>>(), resumed).await;
+
+            // The rejoin limitation. Stop it again, let the chain run away from it, and start it
+            // back up: the payloads it missed are gone for good, because bare simplex backfills
+            // none of them.
+            let stopped = nodes.remove(RESTARTED);
+            stopped.stop();
+            let others: Vec<&Running> = nodes.iter().collect();
+            let away = View::new(nodes[WITNESS].node.watermark.get().get() + OUTAGE);
+            reach(&context, &others, away).await;
+            let missed = nodes[WITNESS]
+                .node
+                .application
+                .inspect()
+                .await
+                .expect("application answers");
+            let restarted = spawn_node(&context, "rejoined", RESTARTED, &keys, &oracle).await;
+            nodes.insert(RESTARTED, restarted);
+
+            // A payload finalized while it was away is one it never saw and can never be given.
+            assert!(
+                nodes[RESTARTED]
+                    .node
+                    .application
+                    .held(missed.tip)
+                    .await
+                    .is_none(),
+                "a payload from the outage was somehow held"
+            );
+
+            // Asked to verify a fork built on that payload, it stays pending: it has the bytes in
+            // front of it and no way to place them. Not false, which would be a verdict it cannot
+            // justify, and not a crash.
+            let orphan = Payload {
+                parent: missed.tip,
+                view: View::new(UNREACHED),
+                certs: Vec::new(),
+            };
+            let genesis = Payload::genesis().digest();
+            let placeable = Payload {
+                parent: genesis,
+                view: View::new(UNREACHED),
+                certs: Vec::new(),
+            };
+            for payload in [&orphan, &placeable] {
+                assert!(
+                    gossiped
+                        .broadcast(Recipients::All, (*payload).clone())
+                        .accepted()
+                );
+            }
+            let mut pending = ask(&nodes[RESTARTED], &keys, UNREACHED, missed.tip, &orphan).await;
+            context.sleep(Duration::from_secs(5)).await;
+            assert!(
+                matches!(pending.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+                "verification of a fork with a missing parent concluded"
+            );
+
+            // The same node, the same moment, a parent it does hold: the wait is the missing
+            // ancestor and nothing else about the restart.
+            assert!(
+                ask(&nodes[RESTARTED], &keys, UNREACHED, genesis, &placeable)
+                    .await
+                    .await
+                    .expect("verification concludes"),
+                "a payload over a parent this node holds was not verified"
+            );
+            assert!(
+                matches!(pending.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+                "the orphan concluded after all"
+            );
+
+            // And it is not wedged as a peer: it still hears the chain move, which is what makes
+            // this a limitation of what it can verify rather than a node that has stopped.
+            let heard = nodes[RESTARTED].node.watermark.get();
+            assert!(heard >= away, "the rejoined node heard nothing");
+        });
     }
 
     #[test]
@@ -692,7 +1104,7 @@ mod tests {
             // Nobody has it, so nobody's chain carries it. One node hears about it, and nobody
             // else does: only the validator holding it can propose it.
             assert_eq!(
-                inclusions(&nodes, &commitment).await,
+                inclusions(&nodes.iter().collect::<Vec<_>>(), &commitment).await,
                 vec![0; VALIDATORS],
                 "a certificate nobody holds was already on a chain"
             );
@@ -704,7 +1116,7 @@ mod tests {
             // It rides into a block, and every node agrees it rode exactly once.
             let deadline = View::new(dispersed.get() + INCLUSION_BUDGET);
             loop {
-                let counts = inclusions(&nodes, &commitment).await;
+                let counts = inclusions(&nodes.iter().collect::<Vec<_>>(), &commitment).await;
                 if counts.iter().all(|count| *count == 1) {
                     break;
                 }

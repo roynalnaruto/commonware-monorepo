@@ -50,7 +50,10 @@ use commonware_cryptography::{
 use commonware_macros::select_loop;
 use commonware_p2p::Recipients;
 use commonware_parallel::Strategy;
-use commonware_runtime::{Clock, ContextCell, Handle, Metrics, Spawner, spawn_cell};
+use commonware_runtime::{
+    Clock, ContextCell, Handle, Metrics, Spawner, spawn_cell,
+    telemetry::metrics::{Counter, MetricsExt as _},
+};
 use commonware_utils::{Participant, channel::mpsc, ordered::Quorum as _};
 use rand_core::CryptoRng;
 use std::{
@@ -212,6 +215,10 @@ where
     timeout: Duration,
     attempts: u8,
     strategy: S,
+    /// Batches that reached a quorum and were certified.
+    certified: Counter,
+    /// Batches abandoned without a quorum.
+    failed: Counter,
     sender: Sender<Message>,
     mailbox: Receiver<Message>,
     batches: mpsc::Receiver<batcher::Job>,
@@ -243,6 +250,8 @@ where
             .scheme
             .participants()
             .quorum::<<Scheme as Verifier>::Faults>() as usize;
+        let certified = context.counter("certified", "Number of batches certified");
+        let failed = context.counter("failed", "Number of batches abandoned without a quorum");
         Self {
             context: ContextCell::new(context),
             coding: coding_namespace(&config.namespace),
@@ -258,6 +267,8 @@ where
             timeout: config.timeout,
             attempts: config.attempts,
             strategy: config.strategy,
+            certified,
+            failed,
             sender: inbox.sender,
             mailbox: inbox.receiver,
             batches,
@@ -488,6 +499,7 @@ where
             // batch is already custodied, so it is the certificate rather than the data that is
             // lost. The blobs go back to intake.
             error!(?commitment, "quorum of attestations did not assemble");
+            self.failed.inc();
             self.originator.cancel(commitment);
             return self.abandon(batch.blobs);
         };
@@ -505,6 +517,7 @@ where
         for (_, id) in &batch.blobs {
             self.board.certified(*id, commitment);
         }
+        self.certified.inc();
         debug!(?commitment, blobs = batch.blobs.len(), "certified batch");
     }
 
@@ -528,6 +541,7 @@ where
                 quorum = self.quorum,
                 "batch did not reach a quorum"
             );
+            self.failed.inc();
             self.originator.cancel(commitment);
             self.abandon(batch.blobs);
         }
@@ -674,7 +688,8 @@ mod tests {
 
         // Per-validator plumbing: the attestor that answers dispersals, the engine that carries
         // them, and the cache that holds gossiped certificates.
-        let (gateway_monitor, gateway_inbox) = mailbox(&context.child("disperser"), NZUsize!(256));
+        let disperser_context = context.child("disperser");
+        let (gateway_monitor, gateway_inbox) = mailbox(&disperser_context, NZUsize!(256));
         let mut originators = Vec::new();
         let mut received = Vec::new();
         let mut prefixes = Vec::new();

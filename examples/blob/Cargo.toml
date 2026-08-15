@@ -13,7 +13,12 @@ workspace = true
 
 [features]
 # Test helpers emitted by `impl_certificate_bls12381_multisig!`.
-mocks = ["commonware-cryptography/mocks"]
+mocks = [
+	"commonware-consensus/mocks",
+	"commonware-cryptography/mocks",
+	"commonware-p2p/mocks",
+	"commonware-resolver/mocks",
+]
 
 [dependencies]
 ark-bn254 = { version = "0.6.0", default-features = false, features = ["scalar_field", "std"] }

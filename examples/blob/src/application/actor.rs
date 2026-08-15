@@ -6,6 +6,7 @@ use super::{
     reporter::Reporter,
 };
 use crate::{
+    assignment::coding_config,
     attestor::{self, Watermark},
     constants::{FRESHNESS, MAX_POOL_CERTS, PAYLOAD_MAX_CERTS},
     gateway::StatusBoard,
@@ -16,6 +17,7 @@ use crate::{
 };
 use commonware_actor::mailbox::{self, Receiver, Sender};
 use commonware_broadcast::buffered;
+use commonware_coding::Config as CodingConfig;
 use commonware_consensus::types::View;
 use commonware_cryptography::{
     Digestible as _,
@@ -185,6 +187,8 @@ pub struct Application<
     scheme: Scheme,
     namespace: Vec<u8>,
     participants: usize,
+    /// Coding parameters this participant set implies, which every header must agree with.
+    coding: Option<CodingConfig>,
     store: PayloadStore<E>,
     payloads: buffered::Mailbox<ed25519::PublicKey, Payload>,
     board: StatusBoard<E>,
@@ -216,6 +220,7 @@ impl<E: BufferPooler + Clock + CryptoRng + Metrics + Spawner + Storage, T: Strat
             Self {
                 context: ContextCell::new(context),
                 participants: config.scheme.participants().len(),
+                coding: coding_config(config.scheme.participants().len()),
                 scheme: config.scheme,
                 namespace: config.namespace,
                 store: config.store,
@@ -566,6 +571,13 @@ impl<E: BufferPooler + Clock + CryptoRng + Metrics + Spawner + Storage, T: Strat
             if dispersed < floor {
                 return Err("certificate is past its freshness");
             }
+            // The coding parameters are a function of the participant set, so a header claiming
+            // any others describes a batch nobody here is a custodian of. Honest attestors reject
+            // such a header, so no quorum should form over one, but a certificate is checked on
+            // what it says rather than on what its signers are assumed to have done.
+            if Some(cert.header.config) != self.coding {
+                return Err("coding configuration does not match the participant set");
+            }
             if self.store.included(parent, &commitment) {
                 return Err("certificate is already on this fork");
             }
@@ -622,6 +634,13 @@ impl<E: BufferPooler + Clock + CryptoRng + Metrics + Spawner + Storage, T: Strat
             debug!(?commitment, "certificate is past its freshness");
             return None;
         }
+        if Some(cert.header.config) != self.coding {
+            debug!(
+                ?commitment,
+                "coding configuration does not match the participant set"
+            );
+            return None;
+        }
         if self.store.included(&self.tip, &commitment) {
             debug!(?commitment, "certificate is already on the finalized chain");
             return None;
@@ -671,7 +690,7 @@ mod tests {
     use commonware_cryptography::{Signer as _, certificate::mocks::Fixture};
     use commonware_parallel::Sequential;
     use commonware_runtime::{Runner, Supervisor as _, deterministic};
-    use commonware_utils::{NZUsize, channel::oneshot};
+    use commonware_utils::{NZU16, NZUsize, channel::oneshot};
     use std::time::Duration;
 
     /// Partition prefix shared by every store in these tests.
@@ -966,6 +985,114 @@ mod tests {
             let child = offer(&harness, ancestor.digest(), ANCESTOR + 1, vec![carried]);
             let context_at = at(&harness, ANCESTOR + 1, (ANCESTOR, ancestor.digest()));
             assert!(!verdict(&mut harness, context_at, &child).await);
+        });
+    }
+
+    #[test]
+    fn p6_dup_cert_in_later_block_rejected() {
+        runner().start(|context| async move {
+            let mut harness = deploy(&context).await;
+
+            // A chain deep enough that the duplicate sits several blocks below the tip: the
+            // ancestry walk has to follow parent links rather than glance at the parent, and it
+            // has to keep following them right down to the freshness horizon.
+            let depth = FRESHNESS.get() - 1;
+            let carried = cert(&harness, 41, ANCESTOR - 1);
+            let commitment = carried.header.commitment;
+            let mut parent = harness.genesis;
+            let mut parent_view = 0;
+            let mut tip = harness.genesis;
+            for offset in 0..depth {
+                let view = ANCESTOR + offset;
+                // Only the first block carries the certificate; every block after it is empty,
+                // so the walk cannot find it without descending.
+                let certs = if offset == 0 {
+                    vec![carried.clone()]
+                } else {
+                    Vec::new()
+                };
+                let block = offer(&harness, parent, view, certs);
+                let context_at = at(&harness, view, (parent_view, parent));
+                assert!(
+                    verdict(&mut harness, context_at, &block).await,
+                    "block at view {view} was rejected"
+                );
+                parent = block.digest();
+                parent_view = view;
+                tip = block.digest();
+            }
+
+            // The same certificate offered again, `depth` blocks later on the same chain and
+            // still inside its freshness window. Inclusion is keyed by the commitment, so a
+            // second ride would leave a registry over commitments ambiguous.
+            let view = ANCESTOR + depth;
+            let repeat = offer(&harness, tip, view, vec![carried.clone()]);
+            let context_at = at(&harness, view, (parent_view, tip));
+            assert!(
+                !verdict(&mut harness, context_at.clone(), &repeat).await,
+                "a certificate already on this chain rode a second time"
+            );
+
+            // A different certificate at the same position is accepted, so the rejection is the
+            // duplicate rather than the depth of the walk or the age of the chain.
+            let other = cert(&harness, 43, ANCESTOR - 1);
+            assert_ne!(other.header.commitment, commitment);
+            let fresh = offer(&harness, tip, view, vec![other]);
+            assert!(verdict(&mut harness, context_at, &fresh).await);
+        });
+    }
+
+    #[test]
+    fn p6_verify_rejects_mismatched_coding_config() {
+        runner().start(|context| async move {
+            let mut harness = deploy(&context).await;
+            let view = ANCESTOR;
+
+            // A certificate a real quorum signed, over a header whose coding parameters are not
+            // the ones this participant set implies. The signatures verify, because the signers
+            // signed exactly these bytes; what does not hold is the claim itself.
+            let honest = cert(&harness, 47, view - 1);
+            let mut header = honest.header.clone();
+            header.config = CodingConfig {
+                minimum_shards: NZU16!(2),
+                extra_shards: NZU16!(3),
+            };
+            assert_ne!(
+                header.config,
+                coding_config(PARTICIPANTS as usize).expect("participant set can be coded")
+            );
+            let forged = test_util::genuine_cert(
+                &harness.attesting,
+                &header,
+                &harness.keys.privates[0],
+                Fr::from(47u64),
+                QUORUM,
+            );
+
+            let payload = offer(&harness, harness.genesis, view, vec![forged.clone()]);
+            let context_at = at(&harness, view, (0, harness.genesis));
+            assert!(
+                !verdict(&mut harness, context_at.clone(), &payload).await,
+                "a certificate over a foreign coding configuration was accepted"
+            );
+
+            // The pool refuses it for the same reason, so a proposer never sees it either.
+            assert!(harness.app.certificate(forged.clone()));
+            context.sleep(Duration::from_secs(1)).await;
+            let snapshot = harness.app.inspect().await.expect("application answers");
+            assert!(
+                snapshot.pool.is_empty(),
+                "a certificate over a foreign coding configuration was pooled"
+            );
+
+            // The same certificate over the configuration this set implies is accepted, so the
+            // rejection is the configuration and nothing else about the fixture.
+            assert!(harness.app.certificate(honest.clone()));
+            context.sleep(Duration::from_secs(1)).await;
+            let snapshot = harness.app.inspect().await.expect("application answers");
+            assert_eq!(snapshot.pool, vec![honest.header.commitment]);
+            let accepted = offer(&harness, harness.genesis, view, vec![honest]);
+            assert!(verdict(&mut harness, context_at, &accepted).await);
         });
     }
 

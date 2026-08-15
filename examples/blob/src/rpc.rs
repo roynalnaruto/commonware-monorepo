@@ -17,8 +17,16 @@
 //! Requests and responses are not correlated by an identifier: a client sends one request at a
 //! time and matches the reply by its shape. That is a documented shortcut of this example, and it
 //! is why nothing here is safe to pipeline.
+//!
+//! # Bounded
+//!
+//! How many clients ask at once is not this node's decision, and a batch query holds a whole
+//! gather open while it waits. At most [`MAX_CONCURRENT_CLIENT_REQUESTS`] requests are answered
+//! together; past that a request is dropped without a reply, which a client sees as the silence it
+//! already has to handle from a validator that is slow or gone, and retries.
 
 use crate::{
+    constants::MAX_CONCURRENT_CLIENT_REQUESTS,
     gateway::{StatusBoard, batcher},
     registry::{Lookup, Registry},
     retrieval,
@@ -30,8 +38,40 @@ use commonware_p2p::{
     Receiver, Recipients, Sender,
     utils::codec::{WrappedReceiver, WrappedSender},
 };
-use commonware_runtime::{BufferPooler, Clock, ContextCell, Handle, Metrics, Spawner, spawn_cell};
+use commonware_runtime::{
+    BufferPooler, Clock, ContextCell, Handle, Metrics, Spawner, spawn_cell,
+    telemetry::metrics::{CounterFamily, EncodeLabelSet, EncodeLabelValue, MetricsExt as _},
+};
+use commonware_utils::concurrency::{Limiter, Reservation};
+use std::{num::NonZeroU32, sync::Arc};
 use tracing::debug;
+
+/// Which of the three requests a client made.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+enum Kind {
+    /// Hand over a blob.
+    Submit,
+    /// Where has a blob got to.
+    Status,
+    /// Give me a batch.
+    GetBatch,
+}
+
+/// What became of a request.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+enum Outcome {
+    /// Taken on, whatever the answer turned out to be.
+    Served,
+    /// Refused without a reply, because too many were already in flight.
+    Shed,
+}
+
+/// Label set for the request counter.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct Request {
+    kind: Kind,
+    outcome: Outcome,
+}
 
 /// Configuration for a [`Server`].
 pub struct Config<E: Clock + Metrics + Spawner> {
@@ -52,17 +92,26 @@ pub struct Server<E: BufferPooler + Clock + Metrics + Spawner> {
     board: StatusBoard<E>,
     registry: Registry,
     retrieval: retrieval::Mailbox,
+    /// Requests in flight.
+    inflight: Arc<Limiter>,
+    /// Requests, by what was asked and whether it was taken on.
+    requests: CounterFamily<Request>,
 }
 
 impl<E: BufferPooler + Clock + Metrics + Spawner> Server<E> {
     /// Builds the server.
     pub fn new(context: E, config: Config<E>) -> Self {
+        let requests = context.family("requests", "Number of client requests by kind and outcome");
+        let limit = NonZeroU32::new(MAX_CONCURRENT_CLIENT_REQUESTS as u32)
+            .expect("the request bound is not zero");
         Self {
             context: ContextCell::new(context),
             batcher: config.batcher,
             board: config.board,
             registry: config.registry,
             retrieval: config.retrieval,
+            inflight: Arc::new(Limiter::new(limit)),
+            requests,
         }
     }
 
@@ -105,18 +154,46 @@ impl<E: BufferPooler + Clock + Metrics + Spawner> Server<E> {
         }
     }
 
-    /// Answers one request on its own task.
+    /// Answers one request on its own task, unless too many are already being answered.
     fn serve<S: Sender<PublicKey = ed25519::PublicKey>>(
         &mut self,
         peer: ed25519::PublicKey,
         request: ClientRequest,
         mut sender: WrappedSender<S, ClientResponse>,
     ) {
+        let kind = match request {
+            ClientRequest::Submit(_) => Kind::Submit,
+            ClientRequest::Status(_) => Kind::Status,
+            ClientRequest::GetBatch(_) => Kind::GetBatch,
+        };
+        let Some(permit) = self.inflight.try_acquire() else {
+            debug!(
+                ?peer,
+                ?kind,
+                "client requests are at their bound; request shed"
+            );
+            self.requests
+                .get_or_create(&Request {
+                    kind,
+                    outcome: Outcome::Shed,
+                })
+                .inc();
+            return;
+        };
+        self.requests
+            .get_or_create(&Request {
+                kind,
+                outcome: Outcome::Served,
+            })
+            .inc();
         let mut batcher = self.batcher.clone();
         let board = self.board.clone();
         let registry = self.registry.clone();
         let retrieval = self.retrieval.clone();
         self.context.child("request").spawn(move |_| async move {
+            // Held until the reply is on its way, so the bound counts the gathers and hashes this
+            // node is carrying rather than the requests it has read off the wire.
+            let _permit: Reservation = permit;
             let response = match request {
                 ClientRequest::Submit(blob) => {
                     // Intake hashes the blob on a shared executor, so this waits on work rather

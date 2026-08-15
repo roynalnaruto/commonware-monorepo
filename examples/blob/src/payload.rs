@@ -30,7 +30,10 @@
 //! leaves the slot empty and every later call returns [`Error::Poisoned`]: a store whose contents
 //! are unknown cannot be allowed to answer questions about what this node has already accepted.
 
-use crate::{constants::FRESHNESS, wire::Payload};
+use crate::{
+    constants::{FRESHNESS, ITEMS_PER_SECTION},
+    wire::Payload,
+};
 use commonware_consensus::types::View;
 use commonware_cryptography::{Digestible as _, sha256, transcript::Summary};
 use commonware_runtime::{BufferPooler, Metrics, Storage, buffer::paged::CacheRef};
@@ -41,15 +44,12 @@ use commonware_storage::{
     },
     translator::TwoCap,
 };
-use commonware_utils::{NZU16, NZU64, NZUsize};
+use commonware_utils::{NZU16, NZUsize};
 use std::{
     collections::{HashMap, HashSet},
-    num::{NonZeroU16, NonZeroU64, NonZeroUsize},
+    num::{NonZeroU16, NonZeroUsize},
     sync::Arc,
 };
-
-/// Views per prunable section, the granularity at which payloads expire.
-const ITEMS_PER_SECTION: NonZeroU64 = NZU64!(10);
 
 /// Page size of the key journal's cache.
 const PAGE_SIZE: NonZeroU16 = NZU16!(1024);

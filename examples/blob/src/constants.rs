@@ -7,8 +7,8 @@
 //! below the wire bounds.
 
 use commonware_consensus::types::ViewDelta;
-use commonware_utils::union;
-use std::time::Duration;
+use commonware_utils::{NZU64, union};
+use std::{num::NonZeroU64, time::Duration};
 
 /// Globally unique namespace for every signature this example produces.
 ///
@@ -286,6 +286,31 @@ pub const FETCH_TIMEOUT_SIM: Duration = Duration::from_millis(250);
 /// Inactive-leader timer in simulated tests.
 pub const SKIP_TIMEOUT_SIM: Duration = Duration::from_secs(2);
 
+/// Views per section of a prunable archive, and the granularity everything expires at.
+///
+/// An archive prunes whole sections: a floor part-way into one keeps every item in it. Custody and
+/// the payload store are both keyed by view and share this granularity, and the certificate
+/// registry follows it too, so a certificate the registry still calls live is one whose shards
+/// custody has genuinely still got. It is also what makes expiry cheap: a floor that has not
+/// crossed a boundary is work nobody has to do.
+pub const ITEMS_PER_SECTION: NonZeroU64 = NZU64!(10);
+
+/// Shard requests a validator serves at once.
+///
+/// One serve is a custody read and an encode of up to [`MAX_SHARD_SIZE`], so the bound is what
+/// stops a peer, or a popular batch, from turning inbound requests into unbounded memory. A
+/// request past the bound is answered with nothing, which the resolver reads as "no data here" and
+/// retries later against the same custodian; the shard exists nowhere else, so shedding is a delay
+/// rather than a loss.
+pub const MAX_CONCURRENT_SHARD_SERVES: usize = 8;
+
+/// Client requests a validator answers at once.
+///
+/// A batch query holds a whole gather open, so this bounds the batches in flight on a validator's
+/// behalf as well as the tasks. A client whose request is shed sees no reply and retries, exactly
+/// as it would against a validator that was slow.
+pub const MAX_CONCURRENT_CLIENT_REQUESTS: usize = 8;
+
 /// How far a dispersal view may sit either side of an attestor's watermark.
 ///
 /// A gateway disperses at the view it believes is current, which may lead or lag the attestor's
@@ -335,6 +360,11 @@ mod tests {
             assert!(RETRIEVAL_TIMEOUT_SIM.as_nanos() < RETRIEVAL_TIMEOUT.as_nanos());
             assert!(SHARD_FETCH_RETRY_SIM.as_nanos() < SHARD_FETCH_RETRY.as_nanos());
             assert!(MAX_EXPIRED_CERTS > 0);
+            // Expiry is section-granular, so a section has to be small next to the horizon it
+            // rounds: a section as long as the window would double how long a shard is kept.
+            assert!(ITEMS_PER_SECTION.get() < WINDOW.get());
+            assert!(MAX_CONCURRENT_SHARD_SERVES > 0);
+            assert!(MAX_CONCURRENT_CLIENT_REQUESTS > 0);
         }
     }
 

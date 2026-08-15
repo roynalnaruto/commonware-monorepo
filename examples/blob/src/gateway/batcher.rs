@@ -28,7 +28,10 @@ use commonware_actor::mailbox::{self, Policy, Receiver, Sender};
 use commonware_coding::Config as CodingConfig;
 use commonware_consensus::types::View;
 use commonware_macros::select_loop;
-use commonware_runtime::{Clock, ContextCell, Handle, Metrics, Spawner, spawn_cell};
+use commonware_runtime::{
+    Clock, ContextCell, Handle, Metrics, Spawner, spawn_cell,
+    telemetry::metrics::{Counter, MetricsExt as _},
+};
 use commonware_utils::channel::mpsc;
 use std::{collections::VecDeque, num::NonZeroUsize, sync::Arc, time::Duration};
 use tracing::{debug, warn};
@@ -134,6 +137,8 @@ pub struct Batcher<E: Clock + Metrics + Spawner> {
     coding: CodingConfig,
     watermark: Watermark,
     board: StatusBoard<E>,
+    /// Batches sealed and handed to the disperser.
+    sealed: Counter,
     mailbox: Receiver<Message>,
     batches: mpsc::Sender<Job>,
 }
@@ -146,6 +151,7 @@ impl<E: Clock + Metrics + Spawner> Batcher<E> {
             context: Arc::new(context.child("submit")),
             sender,
         };
+        let sealed = context.counter("sealed", "Number of batches sealed");
         (
             Self {
                 context: ContextCell::new(context),
@@ -154,6 +160,7 @@ impl<E: Clock + Metrics + Spawner> Batcher<E> {
                 coding: config.coding,
                 watermark: config.watermark,
                 board: config.board,
+                sealed,
                 mailbox: receiver,
                 batches,
             },
@@ -242,6 +249,7 @@ impl<E: Clock + Metrics + Spawner> Batcher<E> {
             sealed,
         };
         debug!(blobs, view = job.view.get(), "sealed batch");
+        self.sealed.inc();
         if self.batches.send(job).await.is_err() {
             debug!("disperser is gone; sealed batch dropped");
         }

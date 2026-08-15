@@ -16,6 +16,13 @@
 // The wire vocabulary is defined ahead of the actors that consume it, so most of it has no caller
 // inside this binary yet.
 #![allow(dead_code)]
+// The workspace's stability sweep documents every crate under `commonware_stability_RESERVED`,
+// which gates out every library item below that level. Nothing this example is built from survives
+// it, and there is nothing here for the sweep to find: this is a `publish = false` binary with no
+// public API to annotate. Compiling it away under that cfg is what lets the sweep document the
+// rest of the workspace.
+#![cfg_attr(commonware_stability_RESERVED, no_main)]
+#![cfg(not(commonware_stability_RESERVED))]
 
 mod application;
 mod assignment;

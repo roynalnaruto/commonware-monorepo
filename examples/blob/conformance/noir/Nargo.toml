@@ -1,0 +1,4 @@
+[package]
+name = "blob_poseidon2"
+type = "bin"
+authors = [""]

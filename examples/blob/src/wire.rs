@@ -535,9 +535,13 @@ mod tests {
     };
     use commonware_parallel::Sequential;
     use commonware_utils::{NZU16, test_rng};
+    use rand_core::Rng as _;
 
     /// Participants in the wire tests.
     const PARTICIPANTS: u32 = 10;
+
+    /// Random buffers fed to each decoder in the adversarial sweep.
+    const GARBAGE_ROUNDS: usize = 32;
 
     /// Decode configuration for a dispersal request in a simulated deployment.
     fn shard_cfg() -> CodecConfig {
@@ -768,6 +772,311 @@ mod tests {
         // Random bytes decode to nothing.
         assert!(Payload::decode_cfg([0xabu8; 64].as_slice(), &(PARTICIPANTS as usize)).is_err());
         assert!(DisperseResponse::decode([0xabu8; 64].as_slice()).is_err());
+    }
+
+    /// One encoded value, and a decoder that reports the canonical re-encoding of what it read.
+    ///
+    /// Re-encoding is what makes a decode checkable without knowing the type: a wire form that
+    /// decodes to a value which encodes to different bytes is a second spelling of that value, and
+    /// a peer that can choose between two spellings can choose between two digests.
+    struct Case {
+        name: &'static str,
+        encoded: Vec<u8>,
+        decode: Decoder,
+    }
+
+    /// Decodes bytes and re-encodes what it read, or reports that they were not a message.
+    type Decoder = Box<dyn Fn(&[u8]) -> Option<Vec<u8>>>;
+
+    /// Builds a [`Case`] for `value`, decoded under `cfg`.
+    fn case<T>(name: &'static str, value: &T, cfg: T::Cfg) -> Case
+    where
+        T: Read + Encode,
+        T::Cfg: Clone + 'static,
+    {
+        Case {
+            name,
+            encoded: value.encode().to_vec(),
+            decode: Box::new(move |bytes: &[u8]| {
+                T::decode_cfg(bytes, &cfg)
+                    .ok()
+                    .map(|decoded| decoded.encode().to_vec())
+            }),
+        }
+    }
+
+    /// Offsets a sweep visits in a message of `len` bytes.
+    ///
+    /// Every offset of a small message, and the framing plus a spread of the interior of a large
+    /// one: a strong shard is a hundred kilobytes of field data, and flipping each of its bytes in
+    /// turn would say nothing that flipping thirty of them does not.
+    fn offsets(len: usize) -> Vec<usize> {
+        if len <= 512 {
+            return (0..len).collect();
+        }
+        let mut visited: Vec<usize> = (0..64).chain(len - 64..len).collect();
+        visited.extend((0..32).map(|step| step * len / 32));
+        visited.sort_unstable();
+        visited.dedup();
+        visited
+    }
+
+    #[test]
+    fn p6_codec_adversarial_sweep() {
+        let mut rng = test_rng();
+        let (header, shards) = dispersal();
+        let cert = cert(&header);
+        let blob = Blob::new(Bytes::from(vec![5u8; 700])).expect("blob is within bounds");
+        let batch = Batch::new(vec![blob.clone()]).expect("batch is within bounds");
+        let participants = PARTICIPANTS as usize;
+        let request = DisperseRequest {
+            header: header.clone(),
+            index: 3,
+            shard: shards[3].clone(),
+        };
+        let record = crate::custody::CustodyRecord {
+            index: 3,
+            shard: shards[3].clone(),
+        };
+        let response = DisperseResponse {
+            commitment: header.commitment,
+            attestation: fixture::<Scheme, MinSig, _>(
+                &mut test_rng(),
+                NAMESPACE,
+                PARTICIPANTS,
+                Scheme::signer,
+                Scheme::verifier,
+            )
+            .schemes[3]
+                .sign::<sha256::Digest>(&header)
+                .expect("scheme can sign"),
+        };
+        let payload = Payload {
+            parent: sha256::Digest::from([7u8; 32]),
+            view: View::new(9),
+            certs: vec![cert.clone()],
+        };
+
+        // Every type that crosses a wire or a storage boundary, each with the configuration a node
+        // decodes it under. Two of them are not messages: a custody record is read back from disk
+        // after a restart, and a shard key is chosen by whoever is asking for a shard.
+        let cases = [
+            case("BlobId", &blob.id(), ()),
+            case("Blob", &blob, ()),
+            case("Batch", &batch, ()),
+            case("BatchHeader", &header, ()),
+            case("ClaimedRoot", &cert.claimed_root, ()),
+            case("DaCert", &cert, participants),
+            case(
+                "ShardKey",
+                &crate::retrieval::ShardKey::new(header.commitment, 3),
+                (),
+            ),
+            case("CustodyRecord", &record, shard_cfg()),
+            case("DisperseRequest", &request, shard_cfg()),
+            case("DisperseResponse", &response, ()),
+            case("Payload", &payload, participants),
+            case("BlobStatus::Pending", &BlobStatus::Pending, ()),
+            case(
+                "BlobStatus::Included",
+                &BlobStatus::Included {
+                    commitment: header.commitment,
+                    view: View::new(9),
+                },
+                (),
+            ),
+            case(
+                "ClientRequest::Submit",
+                &ClientRequest::Submit(blob.clone()),
+                (),
+            ),
+            case(
+                "ClientRequest::Status",
+                &ClientRequest::Status(blob.id()),
+                (),
+            ),
+            case(
+                "ClientRequest::GetBatch",
+                &ClientRequest::GetBatch(header.commitment),
+                (),
+            ),
+            case("BatchResult::Expired", &BatchResult::Expired, participants),
+            case(
+                "BatchResult::Found",
+                &BatchResult::Found {
+                    batch: batch.clone(),
+                    cert: Box::new(cert.clone()),
+                },
+                participants,
+            ),
+            case(
+                "ClientResponse::Ack",
+                &ClientResponse::Ack { id: blob.id() },
+                participants,
+            ),
+            case(
+                "ClientResponse::Status",
+                &ClientResponse::Status {
+                    status: Some(BlobStatus::Certified(header.commitment)),
+                },
+                participants,
+            ),
+            case(
+                "ClientResponse::Batch",
+                &ClientResponse::Batch {
+                    result: BatchResult::Unavailable,
+                },
+                participants,
+            ),
+        ];
+
+        for Case {
+            name,
+            encoded,
+            decode,
+        } in &cases
+        {
+            // What a node writes, a node reads, and writes again identically.
+            assert_eq!(
+                decode(encoded).as_deref(),
+                Some(encoded.as_slice()),
+                "{name} does not round trip canonically"
+            );
+
+            // A message that ends early is never a shorter valid message. Nothing here is allowed
+            // to treat a missing field as an absent one.
+            for cut in offsets(encoded.len()) {
+                assert!(
+                    decode(&encoded[..cut]).is_none(),
+                    "{name} decoded a {cut}-byte prefix of {} bytes",
+                    encoded.len()
+                );
+            }
+
+            // Trailing bytes are extra data rather than padding: a peer must not be able to append
+            // to a message and have it mean the same thing.
+            let mut extended = encoded.clone();
+            extended.push(0);
+            assert!(
+                decode(&extended).is_none(),
+                "{name} accepted a trailing byte"
+            );
+
+            // A flipped byte either fails or is a different message, canonically encoded. What it
+            // must never be is accepted while re-encoding to something else.
+            for offset in offsets(encoded.len()) {
+                let mut mutated = encoded.clone();
+                mutated[offset] ^= 0xff;
+                if let Some(round) = decode(&mutated) {
+                    assert_eq!(
+                        round, mutated,
+                        "{name} accepted a non-canonical encoding at byte {offset}"
+                    );
+                }
+            }
+
+            // And bytes that were never a message at all: the decoder is reached by anything a
+            // peer cares to send, so it may reject but may not panic or normalize.
+            for _ in 0..GARBAGE_ROUNDS {
+                let mut noise = vec![0u8; encoded.len()];
+                rng.fill_bytes(&mut noise);
+                if let Some(round) = decode(&noise) {
+                    assert_eq!(
+                        round,
+                        noise,
+                        "{name} normalized {} random bytes",
+                        noise.len()
+                    );
+                }
+            }
+        }
+
+        // Bounds are the other half: a decoder that is handed a configuration smaller than the
+        // message rejects it rather than allocating to fit.
+        let narrow = CodecConfig {
+            maximum_shard_size: 32,
+        };
+        assert!(crate::custody::CustodyRecord::decode_cfg(record.encode(), &narrow).is_err());
+        assert!(DisperseRequest::decode_cfg(request.encode(), &narrow).is_err());
+        for participants in [0usize, 1, PARTICIPANTS as usize - 1] {
+            assert!(
+                DaCert::decode_cfg(cert.encode(), &participants).is_err(),
+                "a certificate decoded under a set of {participants}"
+            );
+            assert!(
+                Payload::decode_cfg(payload.encode(), &participants).is_err(),
+                "a payload decoded under a set of {participants}"
+            );
+            assert!(
+                BatchResult::decode_cfg(
+                    BatchResult::Found {
+                        batch: batch.clone(),
+                        cert: Box::new(cert.clone()),
+                    }
+                    .encode(),
+                    &participants
+                )
+                .is_err(),
+                "a batch result decoded under a set of {participants}"
+            );
+            assert!(
+                ClientResponse::decode_cfg(
+                    ClientResponse::Batch {
+                        result: BatchResult::Found {
+                            batch: batch.clone(),
+                            cert: Box::new(cert.clone()),
+                        },
+                    }
+                    .encode(),
+                    &participants
+                )
+                .is_err(),
+                "a client response decoded under a set of {participants}"
+            );
+        }
+
+        // Unknown tags are rejected rather than defaulted. Each type is swept from one past its
+        // last variant, so a variant added without a matching arm is caught here.
+        for tag in 3u8..=0xff {
+            assert!(
+                ClientRequest::decode([tag].as_slice()).is_err(),
+                "ClientRequest accepted tag {tag}"
+            );
+            assert!(
+                ClientResponse::decode_cfg([tag].as_slice(), &participants).is_err(),
+                "ClientResponse accepted tag {tag}"
+            );
+        }
+        for tag in 4u8..=0xff {
+            assert!(
+                BlobStatus::decode([tag].as_slice()).is_err(),
+                "BlobStatus accepted tag {tag}"
+            );
+            assert!(
+                BatchResult::decode_cfg([tag].as_slice(), &participants).is_err(),
+                "BatchResult accepted tag {tag}"
+            );
+        }
+
+        // The version byte is a tag too: a dispersal from a build this one cannot speak to is
+        // rejected before any of its fields are read.
+        for version in 0u8..=0xff {
+            if version == BatchHeader::VERSION {
+                continue;
+            }
+            let mut wrong = header.encode().to_vec();
+            wrong[0] = version;
+            assert!(
+                BatchHeader::decode(wrong.as_slice()).is_err(),
+                "BatchHeader accepted version {version}"
+            );
+            let mut wrong = blob.id().encode().to_vec();
+            wrong[0] = version;
+            assert!(
+                BlobId::decode(wrong.as_slice()).is_err(),
+                "BlobId accepted version {version}"
+            );
+        }
     }
 
     #[test]

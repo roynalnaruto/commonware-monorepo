@@ -106,6 +106,22 @@ pub fn dispersal_among(
     )
 }
 
+/// Encodes arbitrary bytes as a gateway would encode a batch.
+///
+/// A gateway chooses what it encodes, and attestors only ever check that a shard belongs to the
+/// commitment, so bytes that are not a batch can reach a certificate. Tests about what happens
+/// afterwards need to be able to produce that.
+pub fn dispersal_of(view: u64, bytes: Bytes) -> (BatchHeader, Vec<StrongShard>) {
+    let config = coding_config(PARTICIPANTS as usize).expect("participant set can be coded");
+    let (commitment, shards) =
+        Coder::encode(&coding_namespace(NAMESPACE), &config, bytes, &Sequential)
+            .expect("bytes encode");
+    (
+        BatchHeader::new(commitment, config, View::new(view)),
+        shards,
+    )
+}
+
 /// The batch [`dispersal`] and [`dispersal_among`] encode, so a reader can compare against it.
 pub fn sample_batch(filler: u8) -> Batch {
     Batch::new(vec![

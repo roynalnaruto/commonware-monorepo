@@ -31,6 +31,9 @@ use commonware_consensus::types::{View, ViewDelta};
 use commonware_cryptography::{certificate::Scheme as _, ed25519, sha256, transcript::Summary};
 use commonware_runtime::{
     BufferPooler, ContextCell, Handle, Metrics, Spawner, Storage, spawn_cell,
+    telemetry::metrics::{
+        Counter, CounterFamily, EncodeLabelSet, EncodeLabelValue, MetricsExt as _,
+    },
 };
 use commonware_utils::channel::oneshot;
 use std::{
@@ -80,6 +83,55 @@ pub enum Error {
     /// The custody store failed, which is fatal to it.
     #[error("custody: {0}")]
     Custody(#[from] custody::Error),
+}
+
+/// Why a dispersal was refused.
+///
+/// Every one of these is a silent rejection on the wire, so the counter is the only place a
+/// gateway's mistake or an attacker's probing becomes visible to an operator.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+enum Refusal {
+    /// Dispersal view outside the accepted band.
+    View,
+    /// Coding configuration disagreed with the participant set.
+    Config,
+    /// Addressed to another validator's shard index.
+    Index,
+    /// Shard failed its coding check.
+    Check,
+    /// A different shard is already held under this commitment.
+    Conflict,
+    /// The scheme could not sign.
+    Sign,
+}
+
+/// Label set for [`Counters::rejected`].
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct Rejected {
+    reason: Refusal,
+}
+
+/// What an operator can see of the attestation path.
+struct Counters {
+    /// Dispersals attested to.
+    attested: Counter,
+    /// Dispersals refused, by reason.
+    rejected: CounterFamily<Rejected>,
+}
+
+impl Counters {
+    /// Registers the counters with `context`.
+    fn init(context: &impl Metrics) -> Self {
+        Self {
+            attested: context.counter("attested", "Number of dispersals attested to"),
+            rejected: context.family("rejected", "Number of dispersals refused by reason"),
+        }
+    }
+
+    /// Records a refusal.
+    fn reject(&self, reason: Refusal) {
+        self.rejected.get_or_create(&Rejected { reason }).inc();
+    }
 }
 
 /// Work handed to the attestor.
@@ -219,6 +271,7 @@ pub struct Attestor<E: BufferPooler + Metrics + Spawner + Storage> {
     config: CodingConfig,
     index: u16,
     slack: ViewDelta,
+    counters: Counters,
     mailbox: Receiver<Message>,
 }
 
@@ -233,6 +286,7 @@ impl<E: BufferPooler + Metrics + Spawner + Storage> Attestor<E> {
         let index = my_index(&config.scheme).ok_or(Error::NoShardIndex)?;
         let coding = coding_config(participants).ok_or(Error::Participants(participants))?;
         let (sender, receiver) = mailbox::new(context.child("mailbox"), config.mailbox_size);
+        let counters = Counters::init(&context);
         Ok((
             Self {
                 context: ContextCell::new(context),
@@ -243,6 +297,7 @@ impl<E: BufferPooler + Metrics + Spawner + Storage> Attestor<E> {
                 config: coding,
                 index,
                 slack: config.slack,
+                counters,
                 mailbox: receiver,
             },
             Mailbox { sender },
@@ -327,6 +382,7 @@ impl<E: BufferPooler + Metrics + Spawner + Storage> Attestor<E> {
                 watermark = watermark.get(),
                 "dispersal view outside the accepted band"
             );
+            self.counters.reject(Refusal::View);
             return Ok(None);
         }
 
@@ -338,6 +394,7 @@ impl<E: BufferPooler + Metrics + Spawner + Storage> Attestor<E> {
                 ?commitment,
                 "coding configuration does not match the participant set"
             );
+            self.counters.reject(Refusal::Config);
             return Ok(None);
         }
 
@@ -351,12 +408,14 @@ impl<E: BufferPooler + Metrics + Spawner + Storage> Attestor<E> {
                 mine = self.index,
                 "dispersal addressed to another validator"
             );
+            self.counters.reject(Refusal::Index);
             return Ok(None);
         }
 
         // The cryptographic step: the shard is bound to this commitment at this index, or it is
         // not a shard of this batch at all.
         if !self.checked(&header, shard.clone()).await {
+            self.counters.reject(Refusal::Check);
             return Ok(None);
         }
 
@@ -371,6 +430,7 @@ impl<E: BufferPooler + Metrics + Spawner + Storage> Attestor<E> {
                 ?commitment,
                 "dispersal conflicts with the shard already held"
             );
+            self.counters.reject(Refusal::Conflict);
             return Ok(None);
         }
 
@@ -392,8 +452,10 @@ impl<E: BufferPooler + Metrics + Spawner + Storage> Attestor<E> {
         // digest type it never uses, since the subject is a header rather than a digest.
         let Some(attestation) = self.scheme.sign::<sha256::Digest>(&header) else {
             error!(?commitment, "scheme cannot sign");
+            self.counters.reject(Refusal::Sign);
             return Ok(None);
         };
+        self.counters.attested.inc();
         Ok(Some(DisperseResponse {
             commitment,
             attestation,
@@ -435,9 +497,8 @@ mod tests {
     use super::*;
     use crate::{
         constants::{ATTEST_SLACK, NAMESPACE},
-        test_util::{PARTICIPANTS, Unused, dispersal, schemes, shard_cfg},
+        test_util::{PARTICIPANTS, Unused, corrupt, dispersal, schemes, shard_cfg},
     };
-    use commonware_codec::{Decode as _, Encode as _};
     use commonware_collector::Handler as _;
     use commonware_cryptography::{Signer as _, certificate::mocks::Fixture};
     use commonware_parallel::Sequential;
@@ -508,23 +569,6 @@ mod tests {
         drop(mailbox);
         handle.await.expect("attestor exits");
         custody(context, "reopened").await
-    }
-
-    /// Flips one bit inside an encoded shard, returning a corrupt shard that still decodes.
-    fn corrupt(shard: &StrongShard) -> StrongShard {
-        let encoded = shard.encode();
-        // The rows and the checksum matrix are written last, so scanning from the end corrupts the
-        // shard data rather than its framing.
-        for offset in (0..encoded.len()).rev() {
-            let mut bytes = encoded.to_vec();
-            bytes[offset] ^= 1;
-            if let Ok(candidate) = StrongShard::decode_cfg(bytes.as_slice(), &shard_cfg())
-                && &candidate != shard
-            {
-                return candidate;
-            }
-        }
-        panic!("no byte of the shard could be flipped");
     }
 
     /// The request an honest gateway would send this node.
@@ -598,6 +642,56 @@ mod tests {
 
             let custody = stopped(&context, mailbox, handle).await;
             assert_eq!(custody.get(&header.commitment).await.expect("lookup"), None);
+        });
+    }
+
+    #[test]
+    fn p6_attestor_counts_attestations_and_refusals() {
+        runner().start(|context| async move {
+            let fixture = schemes();
+            let (header, shards) = dispersal(50, 9);
+            let custody = custody(&context, "custody").await;
+            let (mut mailbox, handle) = start(
+                &context,
+                fixture.schemes[usize::from(INDEX)].clone(),
+                custody,
+                View::new(50),
+            );
+
+            // One dispersal this node attests to, and one of each refusal an operator would
+            // otherwise never hear about, because every rejection is silent on the wire.
+            assert!(
+                dispatch(&mut mailbox, request(&header, &shards))
+                    .await
+                    .is_some()
+            );
+            let mut corrupted = request(&header, &shards);
+            corrupted.shard = corrupt(&corrupted.shard);
+            assert!(dispatch(&mut mailbox, corrupted).await.is_none());
+            let (stale, stale_shards) = dispersal(1, 10);
+            assert!(
+                dispatch(&mut mailbox, request(&stale, &stale_shards))
+                    .await
+                    .is_none()
+            );
+            let mut misaddressed = request(&header, &shards);
+            misaddressed.index = INDEX + 1;
+            assert!(dispatch(&mut mailbox, misaddressed).await.is_none());
+
+            let encoded = context.encode();
+            for expected in [
+                "attested_total 1",
+                "rejected_total{reason=\"Check\"} 1",
+                "rejected_total{reason=\"View\"} 1",
+                "rejected_total{reason=\"Index\"} 1",
+            ] {
+                assert!(
+                    encoded.contains(expected),
+                    "metrics do not report `{expected}`:\n{encoded}"
+                );
+            }
+            drop(mailbox);
+            handle.await.expect("attestor exits");
         });
     }
 
