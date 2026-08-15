@@ -85,10 +85,18 @@ pub enum Error {
 /// Work handed to the attestor.
 enum Message {
     /// A gateway asked this validator to custody a shard.
+    ///
+    /// The request is boxed because it dwarfs everything else in this enum, and every queued
+    /// message would otherwise be sized by it.
     Disperse {
         origin: ed25519::PublicKey,
-        request: DisperseRequest,
+        request: Box<DisperseRequest>,
         responder: oneshot::Sender<DisperseResponse>,
+    },
+    /// A block finalized, so shards older than the retention window can go.
+    Prune {
+        /// The latest finalized view.
+        finalized: View,
     },
 }
 
@@ -97,7 +105,8 @@ impl Policy for Message {
 
     fn handle(overflow: &mut VecDeque<Self>, message: Self) {
         // A dispersal is worth keeping under load: the gateway is waiting on a quorum, and a
-        // request dropped here costs it one of the attestations it needs.
+        // request dropped here costs it one of the attestations it needs. A dropped prune would
+        // leave custody holding shards nobody can ask for until the next finalization.
         overflow.push_back(message);
     }
 }
@@ -110,6 +119,17 @@ impl Policy for Message {
 #[derive(Clone)]
 pub struct Mailbox {
     sender: Sender<Message>,
+}
+
+impl Mailbox {
+    /// Reports the latest finalized view, so custody can drop what it no longer owes.
+    ///
+    /// Expiry is routed through the actor rather than applied by the reporter directly: the
+    /// custody store has one owner, and a second writer could prune a shard out from under an
+    /// attestation being signed. Returns whether the attestor accepted the report.
+    pub fn prune(&self, finalized: View) -> bool {
+        self.sender.enqueue(Message::Prune { finalized }).accepted()
+    }
 }
 
 impl commonware_collector::Handler for Mailbox {
@@ -130,7 +150,7 @@ impl commonware_collector::Handler for Mailbox {
             .sender
             .enqueue(Message::Disperse {
                 origin,
-                request,
+                request: Box::new(request),
                 responder,
             })
             .accepted()
@@ -207,7 +227,7 @@ impl<E: BufferPooler + Metrics + Spawner + Storage> Attestor<E> {
                     origin,
                     request,
                     responder,
-                } => match self.attest(&origin, request).await {
+                } => match self.attest(&origin, *request).await {
                     Ok(Some(response)) => {
                         let _ = responder.send(response);
                     }
@@ -218,6 +238,12 @@ impl<E: BufferPooler + Metrics + Spawner + Storage> Attestor<E> {
                         return;
                     }
                 },
+                Message::Prune { finalized } => {
+                    if let Err(err) = self.custody.prune(finalized).await {
+                        error!(?err, "custody failed; attestor stopping");
+                        return;
+                    }
+                }
             }
         }
     }

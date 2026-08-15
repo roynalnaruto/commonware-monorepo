@@ -148,6 +148,26 @@ pub struct Payload {
     pub certs: Vec<DaCert>,
 }
 
+impl Payload {
+    /// The payload every chain starts from.
+    ///
+    /// Well known rather than agreed: its digest anchors the consensus floor, and every ancestry
+    /// walk ends here. Nothing links to a parent of its own, so the zero digest stands in for one
+    /// that does not exist and is never the digest of a real payload.
+    pub fn genesis() -> Self {
+        Self {
+            parent: sha256::Digest::from([0u8; sha256::Digest::SIZE]),
+            view: View::zero(),
+            certs: Vec::new(),
+        }
+    }
+
+    /// Returns the commitment of every certificate carried, in order.
+    pub fn commitments(&self) -> impl Iterator<Item = Summary> + '_ {
+        self.certs.iter().map(|cert| cert.header.commitment)
+    }
+}
+
 impl Write for Payload {
     fn write(&self, buf: &mut impl BufMut) {
         self.parent.write(buf);

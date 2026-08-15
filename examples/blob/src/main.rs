@@ -17,6 +17,7 @@
 // inside this binary yet.
 #![allow(dead_code)]
 
+mod application;
 mod assignment;
 mod attestor;
 mod blob_tree;
@@ -25,6 +26,8 @@ mod custody;
 mod gateway;
 #[cfg(test)]
 mod measure;
+mod node;
+mod payload;
 mod poseidon2;
 #[cfg(test)]
 mod test_util;

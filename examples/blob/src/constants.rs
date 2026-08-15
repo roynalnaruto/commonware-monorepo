@@ -25,6 +25,9 @@ pub const GATEWAY_ROOT_SUFFIX: &[u8] = b"_GATEWAY_ROOT";
 /// Suffix for the domain separator a batch is erasure-coded under.
 pub const CODING_SUFFIX: &[u8] = b"_DA_CODING";
 
+/// Suffix for consensus votes.
+pub const CONSENSUS_SUFFIX: &[u8] = b"_CONSENSUS";
+
 /// Returns the namespace attestors sign batch headers under.
 pub fn attest_namespace(namespace: &[u8]) -> Vec<u8> {
     union(namespace, ATTEST_SUFFIX)
@@ -44,6 +47,15 @@ pub fn gateway_root_namespace(namespace: &[u8]) -> Vec<u8> {
 /// agree: under a different namespace a shard fails its check even though the bytes are intact.
 pub fn coding_namespace(namespace: &[u8]) -> Vec<u8> {
     union(namespace, CODING_SUFFIX)
+}
+
+/// Returns the namespace consensus votes are signed under.
+///
+/// Validators sign attestations and votes with the same BLS key, so the two namespaces must be
+/// distinct: a vote that could be read as an attestation would let a certificate be assembled out
+/// of consensus traffic.
+pub fn consensus_namespace(namespace: &[u8]) -> Vec<u8> {
+    union(namespace, CONSENSUS_SUFFIX)
 }
 
 /// Consensus votes.
@@ -177,6 +189,55 @@ pub const FRESHNESS: ViewDelta = ViewDelta::new(32);
 /// Custody keeps a shard until view `D + FRESHNESS + WINDOW`.
 pub const WINDOW: ViewDelta = ViewDelta::new(64);
 
+/// Largest number of certificates a node keeps in its pool at once.
+///
+/// The pool holds certificates that have been gossiped but not yet included in a finalized block,
+/// so its size is decided by peers rather than by this node. Bounding it is what stops a gateway
+/// that gossips faster than consensus includes from growing the pool without limit; past the
+/// bound the oldest certificate is dropped, and whoever still cares about it may gossip it again.
+pub const MAX_POOL_CERTS: usize = 512;
+
+/// Payloads cached per peer by the gossip layer that disseminates them.
+///
+/// Bare simplex carries payload digests, not payloads, so a node that has not seen a payload
+/// cannot verify the block naming it. The cache has to cover the payloads a peer may still be
+/// asked about: the proposals of the views currently in flight, plus the forks a slow node is
+/// still catching up on.
+pub const PAYLOAD_DEQUE: usize = 32;
+
+/// How long a leader is given to propose before its view is abandoned.
+pub const LEADER_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How long a view waits for certification progress before it is skipped.
+pub const CERTIFICATION_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long a stuck view waits before rebroadcasting its nullify.
+pub const TIMEOUT_RETRY: Duration = Duration::from_secs(10);
+
+/// How long a request for a missing consensus artifact waits for an answer.
+pub const FETCH_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How long an inactive leader is tolerated before its view is skipped outright.
+pub const SKIP_TIMEOUT: Duration = Duration::from_secs(11);
+
+/// Views below the finalized tip that consensus keeps for recent activity.
+pub const VIEW_RETENTION: ViewDelta = ViewDelta::new(10);
+
+/// Leader timer in simulated tests.
+pub const LEADER_TIMEOUT_SIM: Duration = Duration::from_millis(250);
+
+/// Certification timer in simulated tests.
+pub const CERTIFICATION_TIMEOUT_SIM: Duration = Duration::from_millis(500);
+
+/// Nullify rebroadcast timer in simulated tests.
+pub const TIMEOUT_RETRY_SIM: Duration = Duration::from_secs(1);
+
+/// Consensus fetch timer in simulated tests.
+pub const FETCH_TIMEOUT_SIM: Duration = Duration::from_millis(250);
+
+/// Inactive-leader timer in simulated tests.
+pub const SKIP_TIMEOUT_SIM: Duration = Duration::from_secs(2);
+
 /// How far a dispersal view may sit either side of an attestor's watermark.
 ///
 /// A gateway disperses at the view it believes is current, which may lead or lag the attestor's
@@ -205,19 +266,34 @@ mod tests {
             assert!(BATCH_TIMEOUT_SIM.as_nanos() < DISPERSE_TIMEOUT_SIM.as_nanos());
             assert!(MAX_DISPERSAL_ATTEMPTS > 0);
             assert!(MAX_TRACKED_BLOBS > MAX_BLOBS_PER_BATCH);
+            assert!(MAX_POOL_CERTS > PAYLOAD_MAX_CERTS);
+            assert!(PAYLOAD_DEQUE > 0);
+            // Simplex requires an ordering between its timers, and the simulated variants have
+            // to keep it: certification outlasts the leader, and a view is only skipped after
+            // both certification and a nullify retry have had their chance.
+            assert!(CERTIFICATION_TIMEOUT.as_nanos() > LEADER_TIMEOUT.as_nanos());
+            assert!(SKIP_TIMEOUT.as_nanos() > CERTIFICATION_TIMEOUT.as_nanos());
+            assert!(SKIP_TIMEOUT.as_nanos() > TIMEOUT_RETRY.as_nanos());
+            assert!(CERTIFICATION_TIMEOUT_SIM.as_nanos() > LEADER_TIMEOUT_SIM.as_nanos());
+            assert!(SKIP_TIMEOUT_SIM.as_nanos() > CERTIFICATION_TIMEOUT_SIM.as_nanos());
+            assert!(SKIP_TIMEOUT_SIM.as_nanos() > TIMEOUT_RETRY_SIM.as_nanos());
+            assert!(LEADER_TIMEOUT_SIM.as_nanos() < LEADER_TIMEOUT.as_nanos());
         }
     }
 
     #[test]
     fn p1_constants_namespaces_are_distinct() {
-        let attest = attest_namespace(NAMESPACE);
-        let gateway = gateway_root_namespace(NAMESPACE);
-        let coding = coding_namespace(NAMESPACE);
-        assert_ne!(attest, gateway);
-        assert_ne!(attest, coding);
-        assert_ne!(gateway, coding);
-        assert!(attest.starts_with(NAMESPACE));
-        assert!(gateway.starts_with(NAMESPACE));
-        assert!(coding.starts_with(NAMESPACE));
+        let namespaces = [
+            attest_namespace(NAMESPACE),
+            gateway_root_namespace(NAMESPACE),
+            coding_namespace(NAMESPACE),
+            consensus_namespace(NAMESPACE),
+        ];
+        for (index, namespace) in namespaces.iter().enumerate() {
+            assert!(namespace.starts_with(NAMESPACE));
+            for other in &namespaces[index + 1..] {
+                assert_ne!(namespace, other);
+            }
+        }
     }
 }

@@ -22,8 +22,8 @@ pub mod batcher;
 pub mod disperser;
 pub mod status;
 
-// The gateway module is wired together by the binary's validator role, which lands with the
-// runnable binaries; until then these names have no caller outside their own modules.
+// The sealed-batch handoff is named by the actors on either side of it rather than by anything
+// outside this module.
 #[allow(unused_imports)]
 pub use self::{
     batcher::{Batcher, Job},

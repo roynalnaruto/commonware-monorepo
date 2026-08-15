@@ -6,34 +6,47 @@
 
 use crate::{
     assignment::coding_config,
-    constants::{MAX_MESSAGE_SIZE_SIM, MAX_SHARD_SIZE_SIM, NAMESPACE, coding_namespace},
-    types::{Batch, BatchHeader, Blob, DaCert, Scheme},
+    constants::{
+        MAX_MESSAGE_SIZE_SIM, MAX_SHARD_SIZE_SIM, NAMESPACE, coding_namespace, consensus_namespace,
+    },
+    poseidon2::Fr,
+    types::{Attestation, Batch, BatchHeader, Blob, ClaimedRoot, DaCert, Scheme},
     wire::{Coder, DisperseRequest, DisperseResponse, StrongShard},
 };
 use bytes::Bytes;
 use commonware_actor::Feedback;
-use commonware_broadcast::{Broadcaster, buffered};
-use commonware_codec::{Decode as _, Encode as _};
+use commonware_broadcast::Broadcaster;
+use commonware_codec::{Decode as _, DecodeExt as _, Encode as _};
 use commonware_coding::{CodecConfig, PhasedScheme as _};
 use commonware_consensus::types::View;
 use commonware_cryptography::{
-    bls12381::{certificate::multisig::mocks::fixture, primitives::variant::MinSig},
+    Signer as _,
+    bls12381::{
+        certificate::multisig::mocks::fixture,
+        primitives::{
+            group::Private,
+            ops::keypair,
+            variant::{MinSig, Variant},
+        },
+    },
     certificate::{Scheme as _, mocks::Fixture},
     ed25519, sha256,
+    transcript::Summary,
 };
 use commonware_p2p::{
-    Channel, Manager as _, Recipients,
+    Channel, Manager as _, Receiver as _, Recipients, Sender as _,
     simulated::{Link, Network, Oracle, Receiver, Sender},
 };
 use commonware_parallel::Sequential;
-use commonware_runtime::{Quota, Supervisor as _, deterministic};
+use commonware_runtime::{Quota, Spawner as _, Supervisor as _, deterministic};
 use commonware_utils::{
-    NZU32, NZUsize,
+    NZU32, NZUsize, TryCollect as _,
     channel::{mpsc, oneshot},
-    ordered::Set,
+    ordered::{BiMap, Set},
+    sync::Mutex,
     test_rng,
 };
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 /// Validators in the simulated deployment: `n = 10`, `f = 3`, quorum 7, minimum shards 4.
 pub const PARTICIPANTS: u32 = 10;
@@ -69,7 +82,16 @@ pub fn schemes() -> Fixture<Scheme> {
 ///
 /// `filler` distinguishes batches: two calls with different fillers produce different commitments.
 pub fn dispersal(view: u64, filler: u8) -> (BatchHeader, Vec<StrongShard>) {
-    let config = coding_config(PARTICIPANTS as usize).expect("participant set can be coded");
+    dispersal_among(PARTICIPANTS as usize, view, filler)
+}
+
+/// Encodes a small batch for a deployment of `participants` validators.
+pub fn dispersal_among(
+    participants: usize,
+    view: u64,
+    filler: u8,
+) -> (BatchHeader, Vec<StrongShard>) {
+    let config = coding_config(participants).expect("participant set can be coded");
     let batch = Batch::new(vec![
         Blob::new(Bytes::from(vec![filler; 4096])).expect("blob is within bounds"),
         Blob::new(Bytes::from(vec![filler ^ 0xff; 1024])).expect("blob is within bounds"),
@@ -235,14 +257,43 @@ impl commonware_collector::Monitor for Collected {
     }
 }
 
+/// Gossips certificates over a plain p2p channel.
+///
+/// The production path hands the gateway's disperser the application's mailbox, which pools the
+/// certificate before forwarding it. Tests that run no application use this instead: it sends the
+/// encoded certificate and nothing else, which is what the wire carries either way.
+#[derive(Clone)]
+pub struct Gossip {
+    sender: Arc<Mutex<Sender<ed25519::PublicKey, deterministic::Context>>>,
+}
+
+impl Gossip {
+    /// Wraps a registered sender.
+    pub fn new(sender: Sender<ed25519::PublicKey, deterministic::Context>) -> Self {
+        Self {
+            sender: Arc::new(Mutex::new(sender)),
+        }
+    }
+}
+
+impl Broadcaster for Gossip {
+    type Recipients = Recipients<ed25519::PublicKey>;
+    type Message = DaCert;
+
+    fn broadcast(&self, recipients: Self::Recipients, message: Self::Message) -> Feedback {
+        self.sender.lock().send(recipients, message.encode(), false);
+        Feedback::Ok
+    }
+}
+
 /// Gossips certificates and keeps a copy for the test to inspect.
 ///
 /// A certificate's digest covers its signer set, so a test cannot predict it; watching the
 /// gateway's own broadcast is how a test learns which certificate to look for.
 #[derive(Clone)]
 pub struct Tee {
-    /// The real gossip mailbox.
-    pub inner: buffered::Mailbox<ed25519::PublicKey, DaCert>,
+    /// The real gossip handle.
+    pub inner: Gossip,
     /// Where the copy goes.
     pub seen: mpsc::UnboundedSender<DaCert>,
 }
@@ -254,6 +305,159 @@ impl Broadcaster for Tee {
     fn broadcast(&self, recipients: Self::Recipients, message: Self::Message) -> Feedback {
         let _ = self.seen.send(message.clone());
         self.inner.broadcast(recipients, message)
+    }
+}
+
+/// Drains a certificate-gossip channel into an unbounded queue a test can poll.
+///
+/// A node that runs no application still has to take messages off the channel, or the simulated
+/// network blocks the sender; this is that node's whole certificate handling.
+pub fn collect_certs(
+    context: &deterministic::Context,
+    mut receiver: Receiver<ed25519::PublicKey>,
+    participants: usize,
+) -> mpsc::UnboundedReceiver<DaCert> {
+    let (sender, received) = mpsc::unbounded_channel();
+    context.child("certs").spawn(move |_| async move {
+        while let Ok((_, bytes)) = receiver.recv().await {
+            let Ok(cert) = DaCert::decode_cfg(bytes.as_ref(), &participants) else {
+                continue;
+            };
+            if sender.send(cert).is_err() {
+                return;
+            }
+        }
+    });
+    received
+}
+
+/// Key material for a simulated deployment.
+///
+/// Every validator holds two keys: an ed25519 identity that names it on the network and a BLS
+/// signing key it attests and votes with. The vectors are ordered by ed25519 identity, which is
+/// the order the participant set imposes and therefore the order shard indices follow.
+pub struct Keys {
+    /// Identity private keys, sorted by public key.
+    pub privates: Vec<ed25519::PrivateKey>,
+    /// BLS signing keys, in the same order.
+    pub bls: Vec<Private>,
+    /// The participant set every scheme is built over.
+    pub participants: BiMap<ed25519::PublicKey, <MinSig as Variant>::Public>,
+}
+
+/// Generates key material for `count` validators.
+pub fn keys(count: usize) -> Keys {
+    let mut rng = test_rng();
+    let mut material: Vec<_> = (0..count)
+        .map(|seed| {
+            let identity = ed25519::PrivateKey::from_seed(seed as u64);
+            let (private, public) = keypair::<_, MinSig>(&mut rng);
+            (identity.public_key(), identity, private, public)
+        })
+        .collect();
+    material.sort_by(|a, b| a.0.cmp(&b.0));
+    let participants: BiMap<_, _> = material
+        .iter()
+        .map(|(identity, _, _, public)| (identity.clone(), *public))
+        .try_collect()
+        .expect("identities are unique");
+    Keys {
+        privates: material.iter().map(|(_, key, _, _)| key.clone()).collect(),
+        bls: material.into_iter().map(|(_, _, key, _)| key).collect(),
+        participants,
+    }
+}
+
+/// Builds the attestation schemes for `keys`.
+///
+/// A [`Fixture`] rather than a bare vector so the certificate helpers here work the same over key
+/// material a test generated and over key material the mocks did.
+pub fn attesting(keys: &Keys) -> Fixture<Scheme> {
+    Fixture {
+        participants: keys.privates.iter().map(|key| key.public_key()).collect(),
+        private_keys: keys.privates.clone(),
+        schemes: keys
+            .bls
+            .iter()
+            .map(|private| {
+                Scheme::signer(NAMESPACE, keys.participants.clone(), private.clone())
+                    .expect("signer is a participant")
+            })
+            .collect(),
+        verifier: Scheme::verifier(NAMESPACE, keys.participants.clone()),
+    }
+}
+
+/// Builds the consensus schemes for `keys`, over the same BLS material as [`attesting`].
+pub fn voting(keys: &Keys) -> Fixture<crate::application::Scheme> {
+    let namespace = consensus_namespace(NAMESPACE);
+    Fixture {
+        participants: keys.privates.iter().map(|key| key.public_key()).collect(),
+        private_keys: keys.privates.clone(),
+        schemes: keys
+            .bls
+            .iter()
+            .map(|private| {
+                crate::application::Scheme::signer(
+                    &namespace,
+                    keys.participants.clone(),
+                    private.clone(),
+                )
+                .expect("signer is a participant")
+            })
+            .collect(),
+        verifier: crate::application::Scheme::verifier(&namespace, keys.participants.clone()),
+    }
+}
+
+/// A commitment distinguished only by `byte`.
+pub fn summary(byte: u8) -> Summary {
+    Summary::decode([byte; 32].as_slice()).expect("summary is 32 bytes")
+}
+
+/// A certificate whose header says what a test needs it to say.
+///
+/// The signatures are over a different header, so this is only usable where nothing checks them:
+/// the payload store treats a certificate as an opaque commitment. Assembling the template costs a
+/// signing fixture, so it is built once and cloned.
+pub fn stub_cert(commitment: Summary, view: View) -> DaCert {
+    static TEMPLATE: std::sync::OnceLock<DaCert> = std::sync::OnceLock::new();
+    let mut cert = TEMPLATE
+        .get_or_init(|| {
+            let fixture = schemes();
+            let (header, _) = dispersal(0, 0);
+            genuine_cert(
+                &fixture,
+                &header,
+                &ed25519::PrivateKey::from_seed(0),
+                Fr::from(0u64),
+                QUORUM,
+            )
+        })
+        .clone();
+    cert.header = BatchHeader::new(commitment, cert.header.config, view);
+    cert
+}
+
+/// A certificate a verifier accepts: a real quorum over `header`, and a real gateway claim.
+pub fn genuine_cert(
+    fixture: &Fixture<Scheme>,
+    header: &BatchHeader,
+    gateway: &ed25519::PrivateKey,
+    root: Fr,
+    signers: usize,
+) -> DaCert {
+    let attestations: Vec<Attestation> = fixture.schemes[..signers]
+        .iter()
+        .map(|scheme| scheme.sign::<Unused>(header).expect("scheme can sign"))
+        .collect();
+    DaCert {
+        header: header.clone(),
+        certificate: fixture
+            .verifier
+            .assemble(attestations, &Sequential)
+            .expect("quorum assembles"),
+        claimed_root: ClaimedRoot::sign(NAMESPACE, gateway, &header.commitment, root),
     }
 }
 

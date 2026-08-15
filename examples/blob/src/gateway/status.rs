@@ -117,9 +117,25 @@ impl<E: Clock> StatusBoard<E> {
         self.write(id, BlobStatus::Certified(commitment));
     }
 
-    /// Records that the certificate carrying `id` was included in a finalized block at `view`.
-    pub fn included(&self, id: BlobId, commitment: Summary, view: View) {
-        self.write(id, BlobStatus::Included { commitment, view });
+    /// Records that the certificate over `commitment` was included in a finalized block at `view`.
+    ///
+    /// Takes the batch rather than the blob because that is what a finalized payload names: the
+    /// consensus rail never learns which blobs a batch held. Every blob the board has certified
+    /// under that commitment moves on, which is a scan of a map bounded by [`Self::new`]'s
+    /// capacity and happens once per finalized certificate.
+    pub fn included(&self, commitment: &Summary, view: View) {
+        let now = self.context.current();
+        let mut state = self.state.lock();
+        for tracked in state.entries.values_mut() {
+            if tracked.entry.status != BlobStatus::Certified(*commitment) {
+                continue;
+            }
+            tracked.entry.status = BlobStatus::Included {
+                commitment: *commitment,
+                view,
+            };
+            tracked.written = now;
+        }
     }
 
     /// Records that a gateway has given up on `id`.
@@ -258,7 +274,7 @@ mod tests {
                     attempts: 0
                 })
             );
-            board.included(blob, commitment(7), View::new(42));
+            board.included(&commitment(7), View::new(42));
             assert_eq!(
                 board.get(&blob).expect("blob is tracked").status,
                 BlobStatus::Included {

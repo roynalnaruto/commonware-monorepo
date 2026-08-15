@@ -567,11 +567,10 @@ mod tests {
         types::Batch,
         wire::BlobStatus,
     };
-    use commonware_broadcast::buffered;
     use commonware_codec::EncodeSize as _;
     use commonware_collector::p2p as collector;
     use commonware_consensus::types::View;
-    use commonware_cryptography::{Digestible as _, certificate::mocks::Fixture};
+    use commonware_cryptography::certificate::mocks::Fixture;
     use commonware_macros::select;
     use commonware_parallel::Sequential;
     use commonware_runtime::{Runner, Supervisor as _, deterministic};
@@ -598,8 +597,11 @@ mod tests {
         board: StatusBoard<deterministic::Context>,
         /// Certificates the gateway gossiped, in order.
         certs: mpsc::UnboundedReceiver<DaCert>,
-        /// Every validator's certificate cache, indexed by position.
-        pools: Vec<buffered::Mailbox<ed25519::PublicKey, DaCert>>,
+        /// Certificates each validator heard on the gossip channel, indexed by position.
+        ///
+        /// The gateway's own queue stays empty: p2p never delivers a message back to its sender,
+        /// which is why a gateway's pool is fed by the application rather than by the wire.
+        received: Vec<mpsc::UnboundedReceiver<DaCert>>,
         /// Custody partition prefix of each validator, indexed by position.
         prefixes: Vec<String>,
         /// Every validator's dispersal originator, indexed by position.
@@ -674,9 +676,10 @@ mod tests {
         // them, and the cache that holds gossiped certificates.
         let (gateway_monitor, gateway_inbox) = mailbox(&context.child("disperser"), NZUsize!(256));
         let mut originators = Vec::new();
-        let mut pools = Vec::new();
+        let mut received = Vec::new();
         let mut prefixes = Vec::new();
         let mut local = None;
+        let mut gossip = None;
         for (index, peer) in peers.iter().enumerate() {
             let node = context.child("validator").with_attribute("index", index);
             let prefix = format!("p3-{index}");
@@ -714,21 +717,20 @@ mod tests {
                 crate::test_util::register(&oracle, peer, DISPERSE_RES_CHANNEL).await,
             );
 
-            let (gossip, pool) = buffered::Engine::new(
-                node.child("gossip"),
-                buffered::Config {
-                    public_key: peer.clone(),
-                    mailbox_size: NZUsize!(256),
-                    deque_size: 16,
-                    priority: false,
-                    codec_config: PARTICIPANTS as usize,
-                    peer_provider: oracle.manager(),
-                },
-            );
-            gossip.start(crate::test_util::register(&oracle, peer, CERT_GOSSIP_CHANNEL).await);
+            // Certificates ride a plain channel: a pool has to hear about certificates it has
+            // never heard of, which cache-by-digest gossip cannot deliver.
+            let (sender, receiver) =
+                crate::test_util::register(&oracle, peer, CERT_GOSSIP_CHANNEL).await;
+            if index == GATEWAY {
+                gossip = Some(crate::test_util::Gossip::new(sender));
+            }
+            received.push(crate::test_util::collect_certs(
+                &node,
+                receiver,
+                PARTICIPANTS as usize,
+            ));
 
             originators.push(originator);
-            pools.push(pool);
             prefixes.push(prefix);
         }
 
@@ -763,7 +765,7 @@ mod tests {
                 originator: originators[GATEWAY].clone(),
                 local: local.expect("the gateway runs an attestor"),
                 gossip: Tee {
-                    inner: pools[GATEWAY].clone(),
+                    inner: gossip.expect("the gateway gossips certificates"),
                     seen,
                 },
                 board: board.clone(),
@@ -783,7 +785,7 @@ mod tests {
             submit,
             board,
             certs,
-            pools,
+            received,
             prefixes,
             _originators: originators,
         }
@@ -1086,16 +1088,18 @@ mod tests {
             );
             let signers = genuine(&deployment, &cert, &sample);
 
-            // Every validator can serve the certificate, addressed by its digest. That is what
-            // makes a certificate includable by whichever validator leads the next view.
-            let digest = cert.digest();
-            for (index, pool) in deployment.pools.iter().enumerate() {
-                let held = select! {
+            // Every other validator hears the certificate. That is what makes it includable by
+            // whichever validator leads the next view, rather than only by the gateway.
+            for (index, received) in deployment.received.iter_mut().enumerate() {
+                if index == GATEWAY {
+                    continue;
+                }
+                let heard = select! {
                     _ = context.sleep(Duration::from_secs(5)) => None,
-                    held = pool.subscribe(digest) => held.ok(),
+                    heard = received.recv() => heard,
                 };
-                let held = held.unwrap_or_else(|| panic!("validator {index} has no certificate"));
-                assert_eq!(held.as_ref(), &cert);
+                let heard = heard.unwrap_or_else(|| panic!("validator {index} has no certificate"));
+                assert_eq!(heard, cert);
             }
 
             // Every signer holds the shard that makes the batch reconstructible.
