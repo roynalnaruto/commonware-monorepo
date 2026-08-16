@@ -176,7 +176,7 @@ mod tests {
     use commonware_utils::test_rng;
 
     #[test]
-    fn p1_codec_rejects_non_canonical_claimed_root() {
+    fn codec_rejects_non_canonical_claimed_root() {
         // The field modulus `r`, little-endian, is the smallest non-canonical encoding: it is one
         // past `r - 1`, whose low byte is zero.
         let modulus = {
@@ -199,7 +199,7 @@ mod tests {
     }
 
     #[test]
-    fn p1_cert_codec_roundtrip() {
+    fn codec_roundtrip() {
         let mut rng = test_rng();
         let fixture = fixture::<Scheme, MinSig, _>(
             &mut rng,
@@ -242,7 +242,7 @@ mod tests {
     }
 
     #[test]
-    fn p3_cert_digest_separates_certificates() {
+    fn digest_separates_certificates() {
         let mut rng = test_rng();
         let fixture = fixture::<Scheme, MinSig, _>(
             &mut rng,
@@ -301,7 +301,7 @@ mod tests {
     }
 
     #[test]
-    fn p1_cert_claimed_root_outside_attestation() {
+    fn claimed_root_outside_attestation() {
         let mut rng = test_rng();
         let fixture = fixture::<Scheme, MinSig, _>(
             &mut rng,

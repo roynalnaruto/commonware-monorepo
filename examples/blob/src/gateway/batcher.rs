@@ -18,6 +18,11 @@
 //! send waits, and the batcher stops draining its mailbox while it does. Submissions queue, the
 //! timer keeps running, and the batch that eventually forms is larger. That is the behavior worth
 //! having: under load the gateway makes fewer, fuller batches rather than more, smaller ones.
+//!
+//! # Metrics
+//!
+//! `sealed` counts the batches this gateway has sealed, which is the cadence the timer and the
+//! byte target are there to shape.
 
 use super::status::StatusBoard;
 use crate::{
@@ -328,7 +333,7 @@ mod tests {
     }
 
     #[test]
-    fn p3_batcher_flush_on_size() {
+    fn flush_on_size() {
         runner().start(|context| async move {
             let (mut mailbox, board, mut batches, _handle) =
                 start(&context, TARGET, BATCH_TIMEOUT_SIM, 4);
@@ -373,7 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn p3_batcher_flush_on_timeout() {
+    fn flush_on_timeout() {
         runner().start(|context| async move {
             let (mut mailbox, _board, mut batches, _handle) =
                 start(&context, TARGET, BATCH_TIMEOUT_SIM, 4);
@@ -411,7 +416,7 @@ mod tests {
     }
 
     #[test]
-    fn p3_batcher_bounds_batch() {
+    fn bounds_batch() {
         runner().start(|context| async move {
             // A target no batch can reach and a timer no test outlives, so only the count bound
             // is left to seal one. Hashing a blob is real work, and the deterministic clock
@@ -437,7 +442,7 @@ mod tests {
     }
 
     #[test]
-    fn p3_batcher_duplicate_rejected() {
+    fn duplicate_rejected() {
         runner().start(|context| async move {
             let (mut mailbox, board, mut batches, _handle) =
                 start(&context, usize::MAX, BATCH_TIMEOUT_SIM, 4);

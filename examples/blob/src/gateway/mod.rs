@@ -22,11 +22,4 @@ pub mod batcher;
 pub mod disperser;
 pub mod status;
 
-// The sealed-batch handoff is named by the actors on either side of it rather than by anything
-// outside this module.
-#[allow(unused_imports)]
-pub use self::{
-    batcher::{Batcher, Job},
-    disperser::Disperser,
-    status::StatusBoard,
-};
+pub use self::{batcher::Batcher, disperser::Disperser, status::StatusBoard};

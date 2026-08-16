@@ -17,6 +17,14 @@
 //! A storage failure is different. It is fatal to the custody store, so the actor stops rather
 //! than continuing to answer requests it can no longer honour; its mailbox then reports itself
 //! closed and later requests are dropped unanswered.
+//!
+//! # Metrics
+//!
+//! Because every refusal is silent on the wire, the counters are the only place an operator sees
+//! one: `attested` counts dispersals attested to, and `rejected` counts refusals by `reason`
+//! (`View`, `Config`, `Index`, `Check`, `Conflict`, `Sign`). A gateway that never reaches a quorum
+//! and a validator that refuses everything look identical from the outside and are told apart
+//! here.
 
 use crate::{
     assignment::{coding_config, my_index},
@@ -56,6 +64,7 @@ pub struct Watermark(Arc<AtomicU64>);
 
 impl Watermark {
     /// Creates a watermark at `view`.
+    #[cfg(test)]
     pub fn new(view: View) -> Self {
         Self(Arc::new(AtomicU64::new(view.get())))
     }
@@ -198,8 +207,8 @@ impl Mailbox {
     /// second handle on the store would read shards a prune is part-way through dropping. The
     /// attestor sits on no consensus path, so the hop costs a message.
     ///
-    /// `None` covers every way there is nothing to serve — never attested, already expired, the
-    /// store failed, or the attestor has stopped — because a reader does the same thing in all
+    /// `None` covers every way there is nothing to serve -- never attested, already expired, the
+    /// store failed, or the attestor has stopped -- because a reader does the same thing in all
     /// of them: ask a peer instead.
     pub async fn fetch(&self, commitment: Summary) -> Option<CustodyRecord> {
         let (response, receiver) = oneshot::channel();
@@ -507,7 +516,7 @@ mod tests {
     use std::time::Duration;
 
     /// Partition prefix shared by every store in these tests.
-    const PREFIX: &str = "p2";
+    const PREFIX: &str = "attestor";
 
     /// Position this node holds in every test below.
     const INDEX: u16 = 2;
@@ -593,7 +602,7 @@ mod tests {
     }
 
     #[test]
-    fn p2_attestor_valid_shard_attests() {
+    fn valid_shard_attests() {
         runner().start(|context| async move {
             let fixture = schemes();
             let scheme = fixture.schemes[usize::from(INDEX)].clone();
@@ -624,7 +633,7 @@ mod tests {
     }
 
     #[test]
-    fn p2_attestor_corrupt_shard_no_reply() {
+    fn corrupt_shard_no_reply() {
         runner().start(|context| async move {
             let fixture = schemes();
             let (header, shards) = dispersal(50, 2);
@@ -646,7 +655,7 @@ mod tests {
     }
 
     #[test]
-    fn p6_attestor_counts_attestations_and_refusals() {
+    fn counts_attestations_and_refusals() {
         runner().start(|context| async move {
             let fixture = schemes();
             let (header, shards) = dispersal(50, 9);
@@ -696,7 +705,7 @@ mod tests {
     }
 
     #[test]
-    fn p2_attestor_wrong_index_no_reply() {
+    fn wrong_index_no_reply() {
         runner().start(|context| async move {
             let fixture = schemes();
             let (header, shards) = dispersal(50, 3);
@@ -723,7 +732,7 @@ mod tests {
     }
 
     #[test]
-    fn p2_attestor_bad_config_no_reply() {
+    fn bad_config_no_reply() {
         runner().start(|context| async move {
             let fixture = schemes();
             let (header, shards) = dispersal(50, 4);
@@ -749,7 +758,7 @@ mod tests {
     }
 
     #[test]
-    fn p2_attestor_stale_and_future_view_no_reply() {
+    fn stale_and_future_view_no_reply() {
         runner().start(|context| async move {
             let fixture = schemes();
             let watermark = View::new(100);
@@ -815,7 +824,7 @@ mod tests {
     }
 
     #[test]
-    fn p2_attestor_persists_before_signing() {
+    fn persists_before_signing() {
         runner().start(|context| async move {
             let fixture = schemes();
             let (kept, kept_shards) = dispersal(50, 7);
@@ -854,7 +863,7 @@ mod tests {
     }
 
     #[test]
-    fn p2_attestor_duplicate_dispersal_idempotent() {
+    fn duplicate_dispersal_idempotent() {
         runner().start(|context| async move {
             let fixture = schemes();
             let (header, shards) = dispersal(50, 9);
@@ -891,7 +900,7 @@ mod tests {
     }
 
     #[test]
-    fn p2_attestor_same_batch_new_view_recustodies() {
+    fn same_batch_new_view_recustodies() {
         runner().start(|context| async move {
             let fixture = schemes();
             let (header, shards) = dispersal(50, 15);
@@ -933,7 +942,7 @@ mod tests {
     }
 
     #[test]
-    fn p2_attestor_equivocating_dispersal_no_reply() {
+    fn equivocating_dispersal_no_reply() {
         runner().start(|context| async move {
             let fixture = schemes();
             let (header, shards) = dispersal(50, 10);
@@ -971,7 +980,7 @@ mod tests {
     }
 
     #[test]
-    fn p2_attestor_rejects_verifier_only_scheme() {
+    fn rejects_verifier_only_scheme() {
         runner().start(|context| async move {
             let fixture = schemes();
             let custody = custody(&context, "custody").await;

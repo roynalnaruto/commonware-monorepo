@@ -5,7 +5,7 @@
 //! A secondary peer with an identity of its own that is in nobody's participant set. It signs
 //! nothing, votes on nothing, and custodies nothing; it dials the validators, which never dial it,
 //! and the only channel it speaks on is the client one. It is configured with the participant set
-//! because that is the one thing it takes on trust — every certificate it is shown is checked
+//! because that is the one thing it takes on trust -- every certificate it is shown is checked
 //! against it, and everything else it re-derives for itself.
 //!
 //! # Four commands
@@ -687,7 +687,7 @@ mod tests {
     }
 
     #[test]
-    fn p7_cli_parses_client_args() {
+    fn parses_args() {
         let submitted = parse(&line(&["submit", "--file", "/tmp/in.bin"]))
             .expect("the arguments are well-formed");
         assert_eq!(submitted.seed, 100);
@@ -757,7 +757,7 @@ mod tests {
     }
 
     #[test]
-    fn p7_cli_round_trips_hex_arguments() {
+    fn round_trips_hex_arguments() {
         // What `submit` prints is what `--id` reads, and what `status` prints is what
         // `--commitment` reads: the demo pipes one command's output into the next.
         let id = sample_id();
@@ -785,7 +785,7 @@ mod tests {
     }
 
     #[test]
-    fn p7_cli_rejects_malformed_client_args() {
+    fn rejects_malformed_args() {
         let submit: &[&str] = &["submit", "--file", "/tmp/in.bin"];
 
         // Identities that are not <seed>@<port>, and validators that are not <seed>@<ip:port>.
@@ -885,8 +885,8 @@ mod tests {
     }
 
     #[test]
-    fn p7_cli_enforces_blob_size() {
-        let dir = std::env::temp_dir().join("commonware-blob-p7-size");
+    fn enforces_blob_size() {
+        let dir = std::env::temp_dir().join("commonware-blob-size-check");
         std::fs::create_dir_all(&dir).expect("the scratch directory is writable");
 
         // Blobs are not chunked, so both ends of the range are refused rather than worked around.

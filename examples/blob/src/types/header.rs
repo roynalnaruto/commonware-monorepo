@@ -147,7 +147,7 @@ mod tests {
     use commonware_utils::test_rng;
 
     #[test]
-    fn p1_cert_sign_verify_roundtrip() {
+    fn cert_sign_verify_roundtrip() {
         let mut rng = test_rng();
         let fixture = fixture::<Scheme, MinSig, _>(
             &mut rng,

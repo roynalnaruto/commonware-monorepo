@@ -1,7 +1,23 @@
 //! Messages exchanged on the data-availability and consensus rails.
 //!
 //! Each type carries its own decode bounds, and every `Read` here is bounded: a message arrives
-//! from an untrusted peer, so nothing is sized by a number the peer chose.
+//! from an untrusted peer, so nothing is sized by a number the peer chose. A length prefix is
+//! never trusted to size an allocation, and a message that would exceed its bound is a decode
+//! failure rather than a large allocation.
+//!
+//! # What travels where
+//!
+//! | Message | Channel | Direction |
+//! |---|---|---|
+//! | [`DisperseRequest`] / [`DisperseResponse`] | dispersal | gateway to attestor, and back |
+//! | [`Payload`] | payload gossip | proposer to everyone |
+//! | [`ClientRequest`] / [`ClientResponse`] | client rpc | client to validator, and back |
+//!
+//! Two things travel that are not defined here. A [`DaCert`] is gossiped as
+//! itself, because it is a protocol object rather than an envelope, and a shard answering a
+//! retrieval is a [`CustodyRecord`](crate::custody::CustodyRecord) encoded as opaque bytes,
+//! because the resolver that carries it is generic over `Bytes` and the reader checks what it
+//! decodes against the commitment regardless.
 
 use crate::{
     constants::PAYLOAD_MAX_CERTS,
@@ -615,7 +631,7 @@ mod tests {
     }
 
     #[test]
-    fn p1_codec_all_wire_types_roundtrip() {
+    fn codec_all_types_roundtrip() {
         let (header, shards) = dispersal();
 
         let request = DisperseRequest {
@@ -726,7 +742,7 @@ mod tests {
     }
 
     #[test]
-    fn p1_codec_wire_types_reject_garbage() {
+    fn codec_types_reject_garbage() {
         let (header, shards) = dispersal();
         let request = DisperseRequest {
             header,
@@ -822,7 +838,7 @@ mod tests {
     }
 
     #[test]
-    fn p6_codec_adversarial_sweep() {
+    fn codec_adversarial_sweep() {
         let mut rng = test_rng();
         let (header, shards) = dispersal();
         let cert = cert(&header);
@@ -1080,7 +1096,7 @@ mod tests {
     }
 
     #[test]
-    fn p1_wire_collector_bounds_hold() {
+    fn collector_bounds_hold() {
         // The bound is checked when this instantiation is type-checked, not when it runs.
         assert_collector_bounds::<Pairing>();
     }

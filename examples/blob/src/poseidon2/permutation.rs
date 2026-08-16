@@ -111,7 +111,7 @@ mod tests {
     ///   asserts the length-5 digest above before emitting them. They are Noir-generated, not
     ///   self-generated: nothing below shares code with the implementation it checks.
     #[test]
-    fn p1_poseidon2_noir_vectors() {
+    fn noir_vectors() {
         // Permutation, `Poseidon2Bn254ScalarFieldParams::TEST_VECTOR_{INPUT,OUTPUT}` from
         // barretenberg's poseidon2_params.hpp @ 62c2197f7741a80864861e0ebb3462cd3ff4fa24.
         let mut state = [

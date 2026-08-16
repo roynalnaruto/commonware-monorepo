@@ -2,11 +2,11 @@
 //!
 //! Two costs bound the design, and each has a harness here:
 //!
-//! - **Sealing** ([`p1_measure_poseidon2_sealing`]): before a batch can be encoded, every blob is
+//! - **Sealing** ([`measure_poseidon2_sealing`]): before a batch can be encoded, every blob is
 //!   paged and hashed into a [`BlobId`](crate::types::BlobId) and the identities folded into a
 //!   blob-tree root. This answers whether that fits inside the batch timer at the production
 //!   batch size, and whether it must be parallel to do so.
-//! - **Attestation and retrieval** ([`zoda::p0_measure_zoda_attestation_path`]): every validator
+//! - **Attestation and retrieval** ([`zoda::measure_zoda_attestation_path`]): every validator
 //!   runs `weaken` once per dispersal, and retrieval re-runs it per gathered shard. The gateway's
 //!   `encode` is benchmarked upstream in `commonware-coding`; these two are not.
 //!
@@ -14,8 +14,8 @@
 //! required; debug timings for field arithmetic are meaningless:
 //!
 //! ```sh
-//! cargo test --release -p commonware-blob p1_measure -- --ignored --nocapture
-//! cargo test --release -p commonware-blob p0_measure -- --ignored --nocapture
+//! cargo test --release -p commonware-blob measure_poseidon2_sealing -- --ignored --nocapture
+//! cargo test --release -p commonware-blob measure_zoda_attestation_path -- --ignored --nocapture
 //! ```
 
 use crate::{
@@ -73,7 +73,7 @@ fn time<T>(mut operation: impl FnMut() -> T) -> Duration {
 
 #[test]
 #[ignore = "manual measurement harness"]
-fn p1_measure_poseidon2_sealing() {
+fn measure_poseidon2_sealing() {
     const KIB: usize = 1 << 10;
 
     println!();
@@ -262,7 +262,7 @@ mod zoda {
 
     #[test]
     #[ignore = "manual measurement harness"]
-    fn p0_measure_zoda_attestation_path() {
+    fn measure_zoda_attestation_path() {
         const KIB: usize = 1 << 10;
         const MIB: usize = 1 << 20;
 

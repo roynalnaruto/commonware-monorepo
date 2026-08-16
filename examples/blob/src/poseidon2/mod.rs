@@ -32,9 +32,9 @@
 //! # Domain separation
 //!
 //! Inputs are always prefixed with one of the tags below, so a page leaf can never be reinterpreted
-//! as an inner node or a blob identity. The tags, the 31-byte packing in [`pack`], and the sponge
-//! above are the complete normative description of the hashing scheme; a Noir port needs nothing
-//! else.
+//! as an inner node or a blob identity. The tags, the 31-byte packing in [`pack`](sponge::pack),
+//! and the sponge above are the complete normative description of the hashing scheme; a Noir port
+//! needs nothing else.
 //!
 //! | Tag | Input shape | Meaning |
 //! |---|---|---|
@@ -48,13 +48,7 @@ mod constants;
 mod permutation;
 mod sponge;
 
-// The hashing scheme is exported in full, so some of these names have no caller inside this
-// binary yet.
-#[allow(unused_imports)]
-pub use self::{
-    permutation::{RATE, WIDTH, permute},
-    sponge::{FR_SIZE, Hasher, LIMB_SIZE, from_bytes, hash, pack, packed_len, to_bytes},
-};
+pub use self::sponge::{FR_SIZE, Hasher, from_bytes, hash, packed_len, to_bytes};
 use ark_ff::MontFp;
 
 /// The BN254 scalar field.

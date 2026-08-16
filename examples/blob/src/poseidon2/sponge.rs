@@ -123,7 +123,7 @@ mod tests {
         MontFp!("21888242871839275222246405745257275088548364400416034343698204186575808495616");
 
     #[test]
-    fn p1_poseidon2_hasher_matches_hash() {
+    fn hasher_matches_hash() {
         for len in [0usize, 1, 2, 3, 4, 5, 9, 64] {
             let inputs: Vec<Fr> = (1..=len as u64).map(Fr::from).collect();
             let mut hasher = Hasher::new(len);
@@ -135,7 +135,7 @@ mod tests {
     }
 
     #[test]
-    fn p1_poseidon2_length_and_tag_separate_domains() {
+    fn length_and_tag_separate_domains() {
         // The capacity slot is derived from the input length, so a shorter input is never a
         // prefix-collision of a longer one.
         assert_ne!(hash(&[Fr::from(1u64)]), hash(&[Fr::from(1u64), Fr::ZERO]));
@@ -147,7 +147,7 @@ mod tests {
     }
 
     #[test]
-    fn p1_poseidon2_fr_wire_roundtrip() {
+    fn fr_wire_roundtrip() {
         for element in [Fr::ZERO, Fr::from(1u64), Fr::from(u64::MAX), MAX] {
             assert_eq!(from_bytes(&to_bytes(&element)), Some(element));
         }
@@ -163,7 +163,7 @@ mod tests {
     }
 
     #[test]
-    fn p1_poseidon2_pack_is_injective_for_fixed_length() {
+    fn pack_is_injective_for_fixed_length() {
         assert_eq!(packed_len(0), 0);
         assert_eq!(packed_len(1), 1);
         assert_eq!(packed_len(LIMB_SIZE), 1);

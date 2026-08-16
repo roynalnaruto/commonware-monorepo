@@ -16,7 +16,9 @@
 //! # Expiry
 //!
 //! An entry lives until the batch behind it is past its retrievability window, the same horizon
-//! custody prunes at: `D + FRESHNESS + WINDOW`. Past it the certificate is dropped but the
+//! custody prunes at: `D + FRESHNESS + WINDOW`, rounded down to the same section boundary of
+//! [`ITEMS_PER_SECTION`] views, so that a certificate this map still calls live is one whose shards
+//! custody has genuinely still got. Past it the certificate is dropped but the
 //! commitment is remembered, so a client asking for a batch that has aged out is told so instead
 //! of being told the batch never existed. Those tombstones are bounded by
 //! [`MAX_EXPIRED_CERTS`]; past the bound the oldest is
@@ -112,6 +114,7 @@ impl Registry {
     }
 
     /// Returns the certificate finalized under `commitment` and the view it was included at.
+    #[cfg(test)]
     pub fn get(&self, commitment: &Summary) -> Option<(DaCert, View)> {
         let state = self.state.lock();
         state
@@ -177,11 +180,13 @@ impl Registry {
     }
 
     /// Returns the number of live certificates held.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.state.lock().live.len()
     }
 
     /// Returns whether any certificate is held.
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -206,7 +211,7 @@ mod tests {
     }
 
     #[test]
-    fn p5_registry_records_and_prunes_at_horizon() {
+    fn records_and_prunes_at_horizon() {
         let registry = Registry::new();
         assert!(registry.is_empty());
 
@@ -282,7 +287,7 @@ mod tests {
     }
 
     #[test]
-    fn p5_registry_bounds_expired_commitments() {
+    fn bounds_expired_commitments() {
         let registry = Registry::new();
 
         // More expiries than the tombstone bound, each over its own commitment.

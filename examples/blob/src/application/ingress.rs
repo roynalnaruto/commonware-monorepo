@@ -4,7 +4,9 @@
 //! store and the certificate pool; a mailbox that decided anything would be deciding it on
 //! whichever task happened to call it.
 
-use super::{Context, actor::Snapshot};
+use super::Context;
+#[cfg(test)]
+use super::actor::Snapshot;
 use crate::{types::DaCert, wire::Payload};
 use commonware_actor::{
     Feedback,
@@ -59,11 +61,13 @@ pub(super) enum Message {
     /// A block finalized.
     Finalized { view: View, payload: sha256::Digest },
     /// Diagnostic: the payload behind a digest, if this node holds it.
+    #[cfg(test)]
     Held {
         digest: sha256::Digest,
         response: oneshot::Sender<Option<Arc<Payload>>>,
     },
     /// Diagnostic: what this node believes about the finalized chain and its pool.
+    #[cfg(test)]
     Inspect { response: oneshot::Sender<Snapshot> },
 }
 
@@ -97,6 +101,7 @@ impl Mailbox {
     ///
     /// Returns whether the offer was accepted for processing, not whether it was pooled: the
     /// certificate is checked on the actor's task.
+    #[cfg(test)]
     pub fn certificate(&self, cert: DaCert) -> bool {
         self.sender
             .enqueue(Message::Certificate {
@@ -107,6 +112,7 @@ impl Mailbox {
     }
 
     /// Returns the payload behind `digest`, if this node holds it.
+    #[cfg(test)]
     pub async fn held(&self, digest: sha256::Digest) -> Option<Arc<Payload>> {
         let (response, receiver) = oneshot::channel();
         if !self
@@ -122,6 +128,7 @@ impl Mailbox {
     /// Returns what this node believes about the finalized chain and its certificate pool.
     ///
     /// Diagnostic rather than protocol: nothing in the rail depends on it.
+    #[cfg(test)]
     pub async fn inspect(&self) -> Option<Snapshot> {
         let (response, receiver) = oneshot::channel();
         if !self

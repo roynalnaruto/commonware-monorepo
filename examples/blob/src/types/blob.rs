@@ -2,7 +2,7 @@
 
 use super::Error;
 use crate::{
-    blob_tree::{PageTree, page_count},
+    blob_tree::PageTree,
     constants::MAX_BLOB_SIZE,
     poseidon2::{self, FR_SIZE, Fr, TAG_BLOB},
 };
@@ -43,14 +43,6 @@ impl BlobId {
     /// Returns the committed field element, the form the blob tree hashes.
     pub const fn element(&self) -> Fr {
         self.element
-    }
-
-    /// Reports whether this identity commits to `len` bytes under `page_root`.
-    ///
-    /// The check a reader runs after retrieving a blob: it closes the gap between an identity
-    /// someone handed over and the bytes actually in hand.
-    pub fn matches(&self, len: usize, page_root: Fr) -> bool {
-        *self == Self::new(len, page_root)
     }
 }
 
@@ -107,16 +99,6 @@ impl Blob {
         self.0.len()
     }
 
-    /// Always false: a [`Blob`] cannot be constructed empty.
-    pub const fn is_empty(&self) -> bool {
-        false
-    }
-
-    /// Returns the number of pages the blob occupies.
-    pub const fn pages(&self) -> usize {
-        page_count(self.len())
-    }
-
     /// Computes the blob's identity.
     ///
     /// Hashes every page, so callers that need it more than once should keep the result.
@@ -158,7 +140,7 @@ mod tests {
     use commonware_codec::DecodeExt;
 
     #[test]
-    fn p1_codec_rejects_non_canonical_blob_id() {
+    fn codec_rejects_non_canonical_id() {
         // The field modulus `r`, little-endian, is the smallest non-canonical encoding: it is one
         // past `r - 1`, whose low byte is zero.
         let modulus = {

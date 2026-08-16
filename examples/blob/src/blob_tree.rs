@@ -12,9 +12,12 @@
 //! depth follows the leaf count and its padding is a library detail rather than a wire constant.
 //!
 //! A tree is folded once by [`BlobTree::build`] or [`PageTree::build`] and then answers any number
-//! of [`prove`](BlobTree::prove) calls from the levels it kept. A proof carries the index it was
-//! taken at, so verification needs only the root and the content being opened, and a verifier
-//! never builds a tree at all.
+//! of membership queries from the levels it kept. A proof carries the index it was taken at, so
+//! verification needs only the root and the content being opened, and a verifier never builds a
+//! tree at all. Nothing in this binary asks for one yet -- a claimed root is checked by rebuilding
+//! the whole tree, which a reader holding the batch can do -- so the proof half is built and
+//! exercised by this crate's tests, and is the shape a receipt, or an in-circuit membership check,
+//! would carry.
 //!
 //! # Integrity tier
 //!
@@ -94,6 +97,7 @@ fn build_levels<const D: usize>(leaves: Vec<Fr>) -> Vec<Vec<Fr>> {
 }
 
 /// Collects the sibling digests on the path from leaf `index` to the root of `levels`.
+#[cfg(test)]
 fn path_from_levels<const D: usize>(levels: &[Vec<Fr>], index: usize) -> [Fr; D] {
     let mut siblings = [Fr::ZERO; D];
     let mut position = index;
@@ -108,6 +112,7 @@ fn path_from_levels<const D: usize>(levels: &[Vec<Fr>], index: usize) -> [Fr; D]
 }
 
 /// Recomputes the root implied by `leaf` at `index` and its sibling digests.
+#[cfg(test)]
 fn root_from_path<const D: usize>(index: usize, leaf: Fr, siblings: &[Fr; D]) -> Fr {
     let mut current = leaf;
     let mut position = index;
@@ -150,6 +155,7 @@ impl BlobTree {
     }
 
     /// Returns the membership proof of the blob identity at `index`.
+    #[cfg(test)]
     pub fn prove(&self, index: usize) -> Result<BatchProof, Error> {
         if index >= self.levels[0].len() {
             return Err(Error::UnknownIndex(index));
@@ -188,6 +194,7 @@ impl PageTree {
     }
 
     /// Returns the membership proof of the page at `page`.
+    #[cfg(test)]
     pub fn prove(&self, page: usize) -> Result<PageProof, Error> {
         if page >= self.levels[0].len() {
             return Err(Error::UnknownIndex(page));
@@ -203,6 +210,7 @@ impl PageTree {
 ///
 /// Self-contained: it names the slot it was taken from, so a verifier cannot pair it with the
 /// wrong index by accident.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BatchProof {
     /// Slot the identity occupies in the batch.
@@ -211,6 +219,7 @@ pub struct BatchProof {
     siblings: [Fr; BATCH_DEPTH],
 }
 
+#[cfg(test)]
 impl BatchProof {
     /// Returns the slot the proven identity occupies.
     pub const fn index(&self) -> u16 {
@@ -225,6 +234,7 @@ impl BatchProof {
 }
 
 /// A page's membership in a blob's page tree.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PageProof {
     /// Position the page occupies in the blob.
@@ -233,6 +243,7 @@ pub struct PageProof {
     siblings: [Fr; PAGE_DEPTH],
 }
 
+#[cfg(test)]
 impl PageProof {
     /// Returns the position of the proven page.
     pub const fn index(&self) -> u8 {
@@ -241,9 +252,9 @@ impl PageProof {
 
     /// Checks that `page` occupies this proof's position of the page tree with root `page_root`.
     ///
-    /// The caller is responsible for binding `page_root` to a [`BlobId`] (see
-    /// [`BlobId::matches`](crate::types::BlobId::matches)) and for checking that the length of
-    /// `page` is the one the blob length implies for that position; this only proves membership.
+    /// The caller is responsible for binding `page_root` to a [`BlobId`], by recomputing that
+    /// identity from the length and this root, and for checking that the length of `page` is the
+    /// one the blob length implies for that position; this only proves membership.
     pub fn verify(&self, page_root: &Fr, page: &[u8]) -> bool {
         let index = self.index as usize;
         index < (1 << PAGE_DEPTH)
@@ -301,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn p1_blob_tree_membership_roundtrip() {
+    fn membership_roundtrip() {
         for count in [1usize, 2, 3, 5, 8, 17, MAX_BLOBS_PER_BATCH] {
             let ids: Vec<BlobId> = blobs(count, 64).iter().map(Blob::id).collect();
             let tree = BlobTree::build(&ids).expect("count is within bounds");
@@ -332,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn p1_blob_tree_padded_slots_are_not_members() {
+    fn padded_slots_are_not_members() {
         let ids: Vec<BlobId> = blobs(5, 64).iter().map(Blob::id).collect();
         let tree = BlobTree::build(&ids).expect("count is within bounds");
         let root = tree.root();
@@ -354,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn p1_blob_tree_rejects_out_of_range_counts() {
+    fn rejects_out_of_range_counts() {
         let ids: Vec<BlobId> = blobs(1, 64).iter().map(Blob::id).collect();
         assert!(matches!(BlobTree::build(&[]), Err(Error::BatchCount(0))));
         let tree = BlobTree::build(&ids).expect("count is within bounds");
@@ -368,7 +379,7 @@ mod tests {
     }
 
     #[test]
-    fn p1_blob_page_opening_roundtrip() {
+    fn page_opening_roundtrip() {
         // A multi-page blob with a short final page, and one that is exactly page aligned.
         for len in [BLOB_PAGE * 3 + 17, BLOB_PAGE * 4, MAX_BLOB_SIZE] {
             let blob = blobs(1, len).remove(0);
@@ -403,7 +414,7 @@ mod tests {
     }
 
     #[test]
-    fn p1_blob_page_tree_binds_page_order() {
+    fn page_tree_binds_page_order() {
         // Swapping two pages changes the root: the tree is positional, not a set commitment.
         let blob = blobs(1, BLOB_PAGE * 2).remove(0);
         let mut swapped = blob.as_ref().to_vec();
@@ -417,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn p1_blob_tree_empty_subtrees_are_distinct() {
+    fn empty_subtrees_are_distinct() {
         // Padding constants must not collide across levels, or a subtree could be moved.
         for level in 0..=BATCH_DEPTH {
             for other in (level + 1)..=BATCH_DEPTH {

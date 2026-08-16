@@ -37,13 +37,9 @@ impl Batch {
     }
 
     /// Returns the number of blobs.
+    #[cfg(test)]
     pub const fn len(&self) -> usize {
         self.0.len()
-    }
-
-    /// Always false: a [`Batch`] cannot be constructed empty.
-    pub const fn is_empty(&self) -> bool {
-        false
     }
 
     /// Recomputes every blob identity, in tree-leaf order.
@@ -53,6 +49,7 @@ impl Batch {
 
     /// Recomputes the blob-tree root. Derived: this is the value a gateway's claim is checked
     /// against.
+    #[cfg(test)]
     pub fn root(&self) -> Result<Fr, Error> {
         Ok(BlobTree::build(&self.ids())?.root())
     }
@@ -181,6 +178,7 @@ impl BatchBuilder {
     }
 
     /// Returns the encoded blob bytes accepted so far.
+    #[cfg(test)]
     pub const fn bytes(&self) -> usize {
         self.bytes
     }
@@ -225,7 +223,7 @@ mod tests {
     }
 
     #[test]
-    fn p1_codec_batch_roundtrip() {
+    fn codec_roundtrip() {
         for (count, len) in [(1usize, 1usize), (3, 4096), (5, BLOB_PAGE * 3 + 11)] {
             let batch = Batch::new(blobs(count, len)).expect("batch is within bounds");
             let encoded = batch.encode();
@@ -249,7 +247,7 @@ mod tests {
     }
 
     #[test]
-    fn p1_codec_batch_rejects_oversize() {
+    fn codec_rejects_oversize() {
         let batch = Batch::new(blobs(3, 512)).expect("batch is within bounds");
         let encoded = batch.encode();
 
@@ -299,7 +297,7 @@ mod tests {
     }
 
     #[test]
-    fn p1_batch_builder_enforces_caps() {
+    fn builder_enforces_caps() {
         let mut builder = BatchBuilder::new(BATCH_TARGET_SIM);
         assert!(builder.is_empty());
         assert!(!builder.is_full());

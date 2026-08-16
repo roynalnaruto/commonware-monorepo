@@ -10,8 +10,8 @@
 //! # Shape
 //!
 //! One actor per validator on a single channel, with requests decoded on the way in and responses
-//! encoded on the way out. Two of the three requests wait on something — intake hashes a blob,
-//! a batch query waits on a whole gather — so each request is answered on its own task and the
+//! encoded on the way out. Two of the three requests wait on something -- intake hashes a blob,
+//! a batch query waits on a whole gather -- so each request is answered on its own task and the
 //! loop never blocks behind one client.
 //!
 //! Requests and responses are not correlated by an identifier: a client sends one request at a
@@ -24,6 +24,12 @@
 //! gather open while it waits. At most [`MAX_CONCURRENT_CLIENT_REQUESTS`] requests are answered
 //! together; past that a request is dropped without a reply, which a client sees as the silence it
 //! already has to handle from a validator that is slow or gone, and retries.
+//!
+//! # Metrics
+//!
+//! `requests` counts client requests by `kind` (`Submit`, `Status`, `GetBatch`) and by `outcome`
+//! (`Served`, or `Shed` when the concurrency bound above was already reached). A client sees a shed
+//! request as silence, so the counter is the only place the difference is visible.
 
 use crate::{
     constants::MAX_CONCURRENT_CLIENT_REQUESTS,

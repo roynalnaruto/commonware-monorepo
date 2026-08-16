@@ -166,6 +166,7 @@ impl<E: Clock> StatusBoard<E> {
     }
 
     /// Returns the number of entries held.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.state.lock().entries.len()
     }
@@ -247,7 +248,7 @@ mod tests {
     }
 
     #[test]
-    fn p3_status_transitions() {
+    fn transitions() {
         runner().start(|context| async move {
             let ttl = Duration::from_secs(10);
             let board = StatusBoard::new(context.child("status"), NZUsize!(4), ttl);
@@ -314,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn p3_status_bounded() {
+    fn bounded() {
         runner().start(|context| async move {
             let ttl = Duration::from_secs(10);
             let board = StatusBoard::new(context.child("status"), NZUsize!(4), ttl);

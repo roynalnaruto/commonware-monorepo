@@ -1,4 +1,12 @@
 //! The two things this binary can be: a validator, or a client of one.
+//!
+//! [`validator`] runs the whole node: both rails, every actor, and the storage that survives a
+//! restart. [`client`] runs nothing durable -- it dials validators as a secondary peer, submits,
+//! polls, retrieves, and verifies everything it is told. [`identity`] is what both derive their
+//! keys from, and is the one part of this command line that a real deployment would replace.
+//!
+//! Arguments are parsed into a struct before anything is started, so a misspelled flag fails
+//! before a port is bound or a partition is opened.
 
 pub mod client;
 pub mod identity;

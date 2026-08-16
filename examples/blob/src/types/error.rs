@@ -16,6 +16,7 @@ pub enum Error {
     #[error("batch of {0} encoded bytes is over the permitted size")]
     BatchSize(usize),
     /// A tree index was not occupied.
+    #[cfg(test)]
     #[error("index {0} is not occupied")]
     UnknownIndex(usize),
     /// The same blob was offered to a batch twice.

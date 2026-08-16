@@ -13,7 +13,7 @@
 //! against the commitment at the index it claims, not only one's own, so a reader needs no prior
 //! checking data and no second round of shard exchange: bytes in, [`CheckedShard`] out, and
 //! `minimum_shards` of those decode the batch. Weak shards therefore never appear on this wire.
-//! They would save little in any case — at batch scale a weak shard is within a percent of a
+//! They would save little in any case -- at batch scale a weak shard is within a percent of a
 //! strong one.
 //!
 //! # Trust
@@ -23,6 +23,13 @@
 //! resolver blocks the peer that sent them. What no custodian can do is make the reader accept
 //! bytes that decode to something other than the committed batch, because the commitment binds the
 //! encoding: shards that pass their check reconstruct the batch or they reconstruct nothing.
+//!
+//! # Metrics
+//!
+//! On the serving side, `served` counts shard requests by outcome (answered, nothing held, or shed
+//! because [`MAX_CONCURRENT_SHARD_SERVES`] were already in flight). On the reading side, `gathered`
+//! counts retrievals by outcome and `invalid` counts shards that failed their coding check, which
+//! is the counter that says a custodian is serving something other than what it attested to.
 
 use crate::{
     assignment, attestor,
@@ -79,7 +86,7 @@ type CheckedShard = <Coder as commonware_coding::PhasedScheme>::CheckedShard;
 ///
 /// Fixed size and self-describing, which is what the resolver requires of a key: it is the whole
 /// of what a peer sees, and validity of a response is decided against it alone. The index is not
-/// redundant with the peer's identity — a custodian is asked for the shard it signed for, and
+/// redundant with the peer's identity -- a custodian is asked for the shard it signed for, and
 /// serving any other one is caught by the check rather than by trust in the addressing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ShardKey {
@@ -375,8 +382,6 @@ pub struct Config<T: Strategy> {
     pub shard: CodecConfig,
     /// How long a retrieval may take before it is abandoned.
     pub timeout: Duration,
-    /// Messages buffered before the mailbox spills to its overflow queue.
-    pub mailbox_size: NonZeroUsize,
     /// Parallelism for decoding.
     pub strategy: T,
 }
@@ -874,7 +879,7 @@ mod tests {
     use std::time::Duration;
 
     /// Partition prefix shared by every store in these tests.
-    const PREFIX: &str = "p5";
+    const PREFIX: &str = "retrieval";
 
     /// View every batch in these tests is dispersed at.
     const VIEW: u64 = 40;
@@ -1048,7 +1053,6 @@ mod tests {
                     attestor: attestor_mailbox,
                     shard: test_util::shard_cfg(),
                     timeout: RETRIEVAL_TIMEOUT_SIM,
-                    mailbox_size: NZUsize!(256),
                     strategy: Sequential,
                 },
                 inbox,
@@ -1082,7 +1086,7 @@ mod tests {
     }
 
     #[test]
-    fn p5_retrieval_roundtrip_f_plus_1_of_signers() {
+    fn roundtrip_f_plus_1_of_signers() {
         runner().start(|context| async move {
             let (header, shards) = test_util::dispersal(VIEW, 0x11);
             let expected = test_util::sample_batch(0x11);
@@ -1126,7 +1130,7 @@ mod tests {
     }
 
     #[test]
-    fn p5_retrieval_rejects_forged_shard() {
+    fn rejects_forged_shard() {
         runner().start(|context| async move {
             let (header, shards) = test_util::dispersal(VIEW, 0x22);
             let expected = test_util::sample_batch(0x22);
@@ -1180,7 +1184,7 @@ mod tests {
     }
 
     #[test]
-    fn p5_coordinator_completes_at_threshold_cancels_rest() {
+    fn coordinator_completes_at_threshold_cancels_rest() {
         runner().start(|context| async move {
             let (header, shards) = test_util::dispersal(VIEW, 0x33);
 
@@ -1229,7 +1233,7 @@ mod tests {
     }
 
     #[test]
-    fn p5_coordinator_times_out_cleanly_when_unavailable() {
+    fn coordinator_times_out_cleanly_when_unavailable() {
         runner().start(|context| async move {
             let (header, shards) = test_util::dispersal(VIEW, 0x44);
 
@@ -1278,7 +1282,7 @@ mod tests {
     }
 
     #[test]
-    fn p6_producer_bounds_concurrent_serves() {
+    fn producer_bounds_concurrent_serves() {
         runner().start(|context| async move {
             // An attestor whose actor is never started: its mailbox takes reads and nothing on
             // the other side completes them, so every serve this producer starts stays in flight.
@@ -1353,7 +1357,7 @@ mod tests {
     }
 
     #[test]
-    fn p6_retrieval_rejects_certified_non_batch() {
+    fn rejects_certified_non_batch() {
         runner().start(|context| async move {
             // A gateway chooses what it encodes. Attestors check that a shard belongs to the
             // commitment and nothing more, so a quorum can certify bytes that are not a batch.
@@ -1398,7 +1402,7 @@ mod tests {
     }
 
     #[test]
-    fn p5_retrieval_after_expiry_fails_cleanly() {
+    fn after_expiry_fails_cleanly() {
         runner().start(|context| async move {
             let (header, shards) = test_util::dispersal(VIEW, 0x55);
             let (orphan, _) = test_util::dispersal(VIEW, 0x56);
@@ -1469,7 +1473,7 @@ mod tests {
     }
 
     #[test]
-    fn p5_retrieval_serves_concurrent_commitments() {
+    fn serves_concurrent_commitments() {
         runner().start(|context| async move {
             let (first, first_shards) = test_util::dispersal(VIEW, 0x66);
             let (second, second_shards) = test_util::dispersal(VIEW, 0x67);

@@ -67,7 +67,7 @@ mod tests {
     use commonware_utils::{NZU16, TryCollect as _, ordered::BiMap, test_rng};
 
     #[test]
-    fn p2_assignment_order_matches_participants_sorted() {
+    fn order_matches_participants_sorted() {
         // Key material a configuration file could list in any order.
         let mut rng = test_rng();
         let mut identities = Vec::new();
@@ -119,7 +119,7 @@ mod tests {
     }
 
     #[test]
-    fn p2_assignment_coding_config_tracks_faults() {
+    fn coding_config_tracks_faults() {
         // n = 10 is the simulated deployment: f = 3, so 4 of 10 shards reconstruct.
         assert_eq!(
             coding_config(10),

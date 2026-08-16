@@ -16,10 +16,10 @@
 //!    bytes a stranger chose.
 //! 2. **Derived, availability half.** Re-encoding the bytes reproduces the commitment. ZODA's
 //!    commitment binds the encoding, so bytes that reproduce it *are* the batch the quorum
-//!    attested to — no matter who sent them.
+//!    attested to -- no matter who sent them.
 //! 3. **Claimed vs derived, structure half.** The blob tree rebuilt from those bytes either
 //!    matches the root the gateway signed or it does not. A mismatch is provable misbehaviour by a
-//!    named gateway, and it is recorded as such — but it does not withhold the blob, because
+//!    named gateway, and it is recorded as such -- but it does not withhold the blob, because
 //!    steps 1 and 2 have already settled that these are the right bytes. A gateway can misdescribe
 //!    structure; it cannot fake availability.
 //! 4. **Located.** The blob whose identity matches is returned, byte for byte.
@@ -649,7 +649,7 @@ mod tests {
     }
 
     #[test]
-    fn p5_client_detects_tampered_batch() {
+    fn detects_tampered_batch() {
         runner().start(|context| async move {
             let keys = test_util::keys(VALIDATORS);
             let (batch, header, cert) = certified(&keys, Fr::from(1u64));
@@ -694,7 +694,7 @@ mod tests {
     }
 
     #[test]
-    fn p5_client_detects_false_claimed_root() {
+    fn detects_false_claimed_root() {
         runner().start(|context| async move {
             let keys = test_util::keys(VALIDATORS);
 
@@ -740,7 +740,7 @@ mod tests {
     }
 
     #[test]
-    fn p5_client_rejects_unattested_batch() {
+    fn rejects_unattested_batch() {
         runner().start(|context| async move {
             let keys = test_util::keys(VALIDATORS);
             let (batch, header, cert) = certified(&keys, Fr::from(1u64));
@@ -825,7 +825,7 @@ mod tests {
     async fn deploy(
         context: &deterministic::Context,
         prefix: &str,
-    ) -> (Vec<Node<deterministic::Context>>, Keys, TestClient) {
+    ) -> (Vec<Node>, Keys, TestClient) {
         let keys = test_util::keys(VALIDATORS);
         let validators: Vec<ed25519::PublicKey> = keys
             .privates
@@ -906,9 +906,9 @@ mod tests {
     }
 
     #[test]
-    fn p5_client_status_lifecycle() {
+    fn status_lifecycle() {
         runner().start(|context| async move {
-            let (nodes, keys, mut client) = deploy(&context, "p5-status").await;
+            let (nodes, keys, mut client) = deploy(&context, "status").await;
             let gateway = keys.privates[GATEWAY].public_key();
 
             // Nothing is known about a blob nobody submitted.
@@ -970,9 +970,9 @@ mod tests {
     }
 
     #[test]
-    fn p5_e2e_full_loop() {
+    fn e2e_full_loop() {
         runner().start(|context| async move {
-            let (nodes, keys, mut client) = deploy(&context, "p5-e2e").await;
+            let (nodes, keys, mut client) = deploy(&context, "loop").await;
             let gateway = keys.privates[GATEWAY].public_key();
             let reader = keys.privates[READER].public_key();
 

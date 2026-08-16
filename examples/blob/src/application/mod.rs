@@ -32,14 +32,9 @@ mod actor;
 mod ingress;
 mod reporter;
 
-// Named in the signatures above them rather than reached through this module by anything inside
-// the binary yet: the reporter is handed straight to consensus, and a snapshot is only ever read
-// by whoever asked for one.
-#[allow(unused_imports)]
 pub use self::{
-    actor::{Application, Config, Snapshot},
+    actor::{Application, Config},
     ingress::Mailbox,
-    reporter::Reporter,
 };
 use commonware_cryptography::{bls12381::primitives::variant::MinSig, ed25519, sha256};
 

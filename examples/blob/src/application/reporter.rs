@@ -1,8 +1,8 @@
 //! What the rest of the node learns from consensus.
 //!
-//! One event matters here: a block finalized. That single fact moves every floor the node keeps —
+//! One event matters here: a block finalized. That single fact moves every floor the node keeps --
 //! the attestor's watermark, custody expiry, payload retention, the certificate pool, and the
-//! status a client polls — so it is reported once, to one place, and fanned out on the actor's
+//! status a client polls -- so it is reported once, to one place, and fanned out on the actor's
 //! task where those handles live.
 //!
 //! Notarizations and votes are deliberately ignored. A notarized block may still be replaced, and

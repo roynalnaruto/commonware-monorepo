@@ -4,7 +4,7 @@
 #
 # Four validator processes and one client. The client hands a 256 KiB file to validator 0, watches
 # it get batched, erasure-coded, attested by a quorum, certified, and finalized into a block, and
-# then reads it back from validator 2 — a node that never saw the submission and holds one shard of
+# then reads it back from validator 2 -- a node that never saw the submission and holds one shard of
 # the batch, so what comes back was reconstructed from custodians and verified against the
 # certificate rather than handed over by the node that built it. The file that goes in and the file
 # that comes out are compared byte for byte.
@@ -60,13 +60,13 @@ wait_for_listener() {
 
 # Waits until a validator has finalized MIN_VIEWS blocks.
 #
-# More than one, because the first few views are the ones where a node can still finalize a block
-# whose payload it has not received yet: bare simplex carries payload digests and a separate gossip
-# carries the payloads, and while peers are still connecting the second can lose a race with the
-# first. Such a node never records that block's certificates, so reading a batch back from it would
-# fail. The race is confined to the first half-second, and this is how the demo waits it out rather
-# than sleeping through it. Finalizing at all is also what makes a validator's watermark real,
-# which is what a batch's dispersal view is stamped from.
+# More than one, for two reasons. Finalizing at all is what makes a validator's watermark real,
+# which is what a batch's dispersal view is stamped from. And the first few views are the ones
+# where a node can finalize a block whose payload has not reached it yet: bare simplex carries
+# payload digests while a separate gossip carries the payloads, and while peers are still
+# connecting the second can lose a race with the first. A node that loses it recovers the payload
+# from its gossip cache and records the certificates either way, so this wait is belt and braces
+# rather than the thing that makes the read work.
 wait_for_consensus() {
     local seed=$1 log="$WORK/$seed/validator.log" deadline=$((SECONDS + CONSENSUS_TIMEOUT))
     local views

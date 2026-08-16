@@ -28,6 +28,12 @@
 //! arrived, and then batch-verify the lot. Signatures that fail are dropped along with the
 //! signers that sent them, and collection continues; a peer cannot spend the gateway's quorum by
 //! sending noise.
+//!
+//! # Metrics
+//!
+//! `certified` counts batches that reached a quorum and `failed` counts batches abandoned without
+//! one. The ratio is the health of the data-availability rail as this gateway sees it: everything
+//! it counts as failed is blobs going back to intake for another attempt.
 
 use super::{batcher, status::StatusBoard};
 use crate::{
@@ -382,7 +388,10 @@ where
                 warn!(index, "no validator holds this shard");
                 continue;
             };
-            #[allow(unused_mut)]
+            #[allow(
+                unused_mut,
+                reason = "only the fault injector below, which is test-only, mutates the request"
+            )]
             let mut request = DisperseRequest {
                 header: header.clone(),
                 index,
@@ -697,7 +706,7 @@ mod tests {
         let mut gossip = None;
         for (index, peer) in peers.iter().enumerate() {
             let node = context.child("validator").with_attribute("index", index);
-            let prefix = format!("p3-{index}");
+            let prefix = format!("disperser-{index}");
             let attester = match roles[index] {
                 Role::Honest => {
                     let attestor = attestor(&node, &fixture, index, &prefix).await;
@@ -901,7 +910,7 @@ mod tests {
     }
 
     #[test]
-    fn p3_disperse_all_honest_cert_forms() {
+    fn all_honest_cert_forms() {
         runner().start(|context| async move {
             let mut deployment = deploy(&context, &roles(&[]), None).await;
             let sample = blobs(2, 8 * 1024, 0x51);
@@ -936,7 +945,7 @@ mod tests {
     }
 
     #[test]
-    fn p3_disperse_f_withhold_cert_forms() {
+    fn f_withhold_cert_forms() {
         runner().start(|context| async move {
             // Three validators, the most the fault model allows, never answer.
             let silent = [7usize, 8, 9];
@@ -965,7 +974,7 @@ mod tests {
     }
 
     #[test]
-    fn p3_disperse_f_plus_1_withhold_no_cert_timeout() {
+    fn f_plus_1_withhold_no_cert_timeout() {
         runner().start(|context| async move {
             // One more than the fault model allows: the quorum is out of reach.
             let roles = roles(&[
@@ -1011,7 +1020,7 @@ mod tests {
     }
 
     #[test]
-    fn p3_disperse_corrupt_one_shard_that_validator_absent_from_cert() {
+    fn corrupt_one_shard_that_validator_absent_from_cert() {
         runner().start(|context| async move {
             // The gateway sends validator 5 a shard that is not its shard.
             const VICTIM: u16 = 5;
@@ -1049,7 +1058,7 @@ mod tests {
     }
 
     #[test]
-    fn p3_disperse_byzantine_garbage_attestation_not_counted() {
+    fn byzantine_garbage_attestation_not_counted() {
         runner().start(|context| async move {
             // Validator 5 answers instantly with a signature over a subject nobody asked about,
             // so its reply is among the first the gateway collects.
@@ -1078,7 +1087,7 @@ mod tests {
     }
 
     #[test]
-    fn p3_e2e_bytes_to_cert() {
+    fn e2e_bytes_to_cert() {
         runner().start(|context| async move {
             let mut deployment = deploy(&context, &roles(&[]), None).await;
 

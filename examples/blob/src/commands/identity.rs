@@ -81,9 +81,9 @@ pub fn participants(
 /// This deployment derives both halves of every pair itself, so the proof this verifies is one it
 /// just produced: it can only pass. The startup check is the deliverable rather than its verdict.
 /// A deployment whose participants publish their own public keys runs exactly this loop over
-/// proofs their holders produced, and it is what stops a rogue-key registration — a public key
+/// proofs their holders produced, and it is what stops a rogue-key registration -- a public key
 /// chosen as a function of the others, so that an aggregate over the set verifies under a
-/// signature its owner never contributed to — from ever reaching the participant set.
+/// signature its owner never contributed to -- from ever reaching the participant set.
 pub fn verify_possession(seeds: &[u64], namespace: &[u8]) -> Result<(), u64> {
     for seed in seeds {
         let identity = Identity::from_seed(*seed);
@@ -119,7 +119,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     #[test]
-    fn p7_identity_seeds_are_deterministic_and_distinct() {
+    fn seeds_are_deterministic_and_distinct() {
         let a = Identity::from_seed(7);
         let again = Identity::from_seed(7);
         let b = Identity::from_seed(8);
@@ -133,7 +133,7 @@ mod tests {
     }
 
     #[test]
-    fn p7_identity_participants_order_by_key() {
+    fn participants_order_by_key() {
         let seeds = [3u64, 1, 2, 0];
         let set = participants(&seeds).expect("seeds are distinct");
         let mut expected: Vec<_> = seeds
@@ -149,12 +149,12 @@ mod tests {
     }
 
     #[test]
-    fn p7_identity_possession_holds_for_every_participant() {
+    fn possession_holds_for_every_participant() {
         assert_eq!(verify_possession(&[0, 1, 2, 3], NAMESPACE), Ok(()));
     }
 
     #[test]
-    fn p7_cli_parses_addresses() {
+    fn parses_addresses() {
         assert_eq!(parse_local("3@3003"), Some((3, 3003)));
         assert_eq!(
             parse_remote("0@127.0.0.1:3000"),

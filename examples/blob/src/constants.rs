@@ -2,9 +2,10 @@
 //!
 //! Values here fall into two groups, and the distinction matters. **Wire bounds** (`MAX_*`) are
 //! part of the format: every `Read` implementation enforces them, so changing one is a breaking
-//! change that every peer must adopt at once. **Policy targets** (`*_TARGET`, `*_TIMEOUT`, the
-//! `*_SIM` variants) are local choices a node can change unilaterally; they only ever sit at or
-//! below the wire bounds.
+//! change that every peer must adopt at once. **Policy targets** (`*_TARGET`, `*_TIMEOUT`) are
+//! local choices a node can change unilaterally; they only ever sit at or below the wire bounds.
+//! The `*_SIM` values are the second kind again, chosen for a simulated network where nothing
+//! waits on real hardware, and they exist only in test builds.
 
 use commonware_consensus::types::ViewDelta;
 use commonware_runtime::Quota;
@@ -71,10 +72,11 @@ pub const CERTIFICATE_CHANNEL: u64 = 1;
 /// Consensus block resolution.
 pub const RESOLVER_CHANNEL: u64 = 2;
 
-/// Client blob submissions to a gateway.
-pub const SUBMIT_CHANNEL: u64 = 3;
-
 /// Gateway to attestor shard dispersal.
+///
+/// Channel `3` is unassigned. Client submissions travel on [`CLIENT_RPC_CHANNEL`] with the rest of
+/// the client protocol, and an identifier is a wire agreement: a gap costs nothing, while
+/// renumbering costs every peer at once.
 pub const DISPERSE_REQ_CHANNEL: u64 = 4;
 
 /// Attestor to gateway attestations.
@@ -173,12 +175,14 @@ pub const PAYLOAD_MAX_CERTS: usize = 128;
 pub const BATCH_TARGET: usize = 8 * 1024 * 1024;
 
 /// Batch size a gateway aims for in simulated tests.
+#[cfg(test)]
 pub const BATCH_TARGET_SIM: usize = 256 * 1024;
 
 /// How long a gateway waits for more blobs before sealing an undersized batch.
 pub const BATCH_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Batch timer in simulated tests.
+#[cfg(test)]
 pub const BATCH_TIMEOUT_SIM: Duration = Duration::from_millis(100);
 
 /// How long a gateway waits for a quorum of attestations before abandoning a batch.
@@ -188,6 +192,7 @@ pub const BATCH_TIMEOUT_SIM: Duration = Duration::from_millis(100);
 pub const DISPERSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Dispersal timer in simulated tests.
+#[cfg(test)]
 pub const DISPERSE_TIMEOUT_SIM: Duration = Duration::from_millis(500);
 
 /// How many dispersals a blob may take part in before a gateway gives up on it.
@@ -204,6 +209,7 @@ pub const MAX_DISPERSAL_ATTEMPTS: u8 = 3;
 pub const MAX_SHARD_SIZE: usize = 8 * 1024 * 1024;
 
 /// Strong shard bound in simulated tests, where batches are small.
+#[cfg(test)]
 pub const MAX_SHARD_SIZE_SIM: usize = 1024 * 1024;
 
 /// Largest p2p message a node accepts.
@@ -214,6 +220,7 @@ pub const MAX_SHARD_SIZE_SIM: usize = 1024 * 1024;
 pub const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
 /// p2p message bound in simulated tests.
+#[cfg(test)]
 pub const MAX_MESSAGE_SIZE_SIM: usize = 2 * 1024 * 1024;
 
 /// Largest number of blob statuses a gateway remembers at once.
@@ -239,6 +246,7 @@ pub const STATUS_TTL: Duration = Duration::from_secs(300);
 pub const RETRIEVAL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Retrieval deadline in simulated tests.
+#[cfg(test)]
 pub const RETRIEVAL_TIMEOUT_SIM: Duration = Duration::from_secs(2);
 
 /// How long one shard request waits on one custodian before the resolver tries again.
@@ -249,12 +257,14 @@ pub const RETRIEVAL_TIMEOUT_SIM: Duration = Duration::from_secs(2);
 pub const SHARD_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Shard request timer in simulated tests.
+#[cfg(test)]
 pub const SHARD_FETCH_TIMEOUT_SIM: Duration = Duration::from_millis(400);
 
 /// How long a shard request waits in the resolver's queue before it is retried.
 pub const SHARD_FETCH_RETRY: Duration = Duration::from_secs(2);
 
 /// Shard retry timer in simulated tests.
+#[cfg(test)]
 pub const SHARD_FETCH_RETRY_SIM: Duration = Duration::from_millis(200);
 
 /// Performance the resolver assumes of a custodian it has never fetched from.
@@ -267,6 +277,7 @@ pub const SHARD_FETCH_INITIAL: Duration = Duration::from_millis(500);
 pub const CLIENT_TIMEOUT: Duration = Duration::from_secs(35);
 
 /// Client request timer in simulated tests.
+#[cfg(test)]
 pub const CLIENT_TIMEOUT_SIM: Duration = Duration::from_secs(4);
 
 /// Commitments the certificate registry remembers as expired.
@@ -324,18 +335,23 @@ pub const SKIP_TIMEOUT: Duration = Duration::from_secs(11);
 pub const VIEW_RETENTION: ViewDelta = ViewDelta::new(10);
 
 /// Leader timer in simulated tests.
+#[cfg(test)]
 pub const LEADER_TIMEOUT_SIM: Duration = Duration::from_millis(250);
 
 /// Certification timer in simulated tests.
+#[cfg(test)]
 pub const CERTIFICATION_TIMEOUT_SIM: Duration = Duration::from_millis(500);
 
 /// Nullify rebroadcast timer in simulated tests.
+#[cfg(test)]
 pub const TIMEOUT_RETRY_SIM: Duration = Duration::from_secs(1);
 
 /// Consensus fetch timer in simulated tests.
+#[cfg(test)]
 pub const FETCH_TIMEOUT_SIM: Duration = Duration::from_millis(250);
 
 /// Inactive-leader timer in simulated tests.
+#[cfg(test)]
 pub const SKIP_TIMEOUT_SIM: Duration = Duration::from_secs(2);
 
 /// Views per section of a prunable archive, and the granularity everything expires at.
@@ -377,7 +393,7 @@ mod tests {
     use crate::blob_tree::{BATCH_DEPTH, PAGE_DEPTH};
 
     #[test]
-    fn p1_constants_bounds_match_tree_depths() {
+    fn bounds_match_tree_depths() {
         const {
             assert!(MAX_BLOBS_PER_BATCH == 1 << BATCH_DEPTH);
             assert!(MAX_BLOB_SIZE / BLOB_PAGE == 1 << PAGE_DEPTH);
@@ -426,7 +442,7 @@ mod tests {
     }
 
     #[test]
-    fn p1_constants_namespaces_are_distinct() {
+    fn namespaces_are_distinct() {
         let namespaces = [
             attest_namespace(NAMESPACE),
             gateway_root_namespace(NAMESPACE),

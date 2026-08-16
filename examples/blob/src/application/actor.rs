@@ -122,7 +122,10 @@ struct Pending {
 /// What this node believes about the finalized chain and its certificate pool.
 ///
 /// Diagnostic rather than protocol: nothing in the rail reads it, and it is a copy rather than a
-/// handle, so what it says was true when it was taken.
+/// handle, so what it says was true when it was taken. Its consumer is this crate's tests, which
+/// is why it exists only in test builds: a node in production is asked nothing about itself, and
+/// answering would mean holding the actor's task while a chain is walked.
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     /// Latest finalized view.
@@ -135,6 +138,7 @@ pub struct Snapshot {
     pub chain: Vec<(View, Vec<Summary>)>,
 }
 
+#[cfg(test)]
 impl Snapshot {
     /// Returns how many payloads of the finalized chain carry `commitment`.
     ///
@@ -409,9 +413,22 @@ impl<E: BufferPooler + Clock + CryptoRng + Metrics + Spawner + Storage, T: Strat
                 self.finalized = view;
                 self.tip = payload;
                 self.watermark.set(view);
+
+                // Consensus does not wait for this node to place a payload before finalizing the
+                // block that names it, so a block can finalize while its payload is still only in
+                // the gossip cache. That payload is recovered here rather than left behind.
+                let mut finalized = self.store.get(&payload);
+                if finalized.is_none() {
+                    finalized = self.recover(view, payload).await?;
+                    if finalized.is_some() {
+                        // It may be the parent a later payload was held for, and a node that has
+                        // just regained the chain should verify the rest of it normally.
+                        self.resume(payload).await?;
+                    }
+                }
                 info!(
                     view = view.get(),
-                    certs = self.store.get(&payload).map_or(0, |held| held.certs.len()),
+                    certs = finalized.as_ref().map_or(0, |held| held.certs.len()),
                     "finalized"
                 );
 
@@ -420,7 +437,7 @@ impl<E: BufferPooler + Clock + CryptoRng + Metrics + Spawner + Storage, T: Strat
                 // end of the write path, and the registry is now the only place the read path can
                 // learn who custodies the batch. Recording happens before any floor moves, so
                 // nothing is pruned out from under a reader that arrives in the same view.
-                if let Some(finalized) = self.store.get(&payload) {
+                if let Some(finalized) = finalized {
                     for cert in &finalized.certs {
                         let commitment = cert.header.commitment;
                         self.registry.record(cert.clone(), view);
@@ -453,9 +470,11 @@ impl<E: BufferPooler + Clock + CryptoRng + Metrics + Spawner + Storage, T: Strat
                 self.attestor.prune(view);
                 self.registry.prune(view);
             }
+            #[cfg(test)]
             Message::Held { digest, response } => {
                 let _ = response.send(self.store.get(&digest));
             }
+            #[cfg(test)]
             Message::Inspect { response } => {
                 let _ = response.send(Snapshot {
                     finalized: self.finalized,
@@ -553,6 +572,50 @@ impl<E: BufferPooler + Clock + CryptoRng + Metrics + Spawner + Storage, T: Strat
         self.store.insert(payload).await?;
         let _ = response.send(true);
         Ok(Some(digest))
+    }
+
+    /// Stores a finalized payload this node never verified, from the gossip cache.
+    ///
+    /// A verification that is still waiting -- on the payload itself, or on a parent that has not
+    /// arrived -- has stored nothing, and once its view settles it is concluded rather than left
+    /// open. Without this, a node that lost that race would hold no payload for a block the chain
+    /// has finalized, and so would never record the certificates it carries: it could not serve
+    /// retrieval of those batches even though it custodies shards of them.
+    ///
+    /// Nothing here is re-checked. The digest binds the bytes, and what a payload at this position
+    /// has to satisfy was decided by the quorum that finalized it; a node that made its own
+    /// judgement now could only disagree with the chain it is following.
+    ///
+    /// Returns `None` when the cache has not got it either, which is the case nothing recovers
+    /// from: no part of this example backfills payloads.
+    async fn recover(
+        &mut self,
+        view: View,
+        digest: sha256::Digest,
+    ) -> Result<Option<Arc<Payload>>, payload::Error> {
+        let Some(payload) = self.payloads.get(digest).await else {
+            return Ok(None);
+        };
+
+        // The view a payload was built for is archived as the view it is held at, so a payload
+        // that names another one would be filed where no ancestry walk will find it. Only a
+        // quorum that finalized a malformed proposal produces one.
+        if payload.view != view {
+            warn!(
+                view = view.get(),
+                claimed = payload.view.get(),
+                ?digest,
+                "finalized payload is not bound to the view it finalized at"
+            );
+            return Ok(None);
+        }
+        self.store.insert(payload.clone()).await?;
+        debug!(
+            view = view.get(),
+            ?digest,
+            "recovered a finalized payload from gossip"
+        );
+        Ok(Some(payload))
     }
 
     /// Checks every certificate a payload carries, in cost order.
@@ -699,7 +762,7 @@ mod tests {
     use std::time::Duration;
 
     /// Partition prefix shared by every store in these tests.
-    const PREFIX: &str = "p4";
+    const PREFIX: &str = "application";
 
     /// Mailbox depth, comfortably above anything a test enqueues.
     const MAILBOX: NonZeroUsize = NZUsize!(64);
@@ -883,7 +946,7 @@ mod tests {
     }
 
     #[test]
-    fn p4_propose_drains_pool_excludes_dups_and_stale() {
+    fn propose_drains_pool_excludes_dups_and_stale() {
         runner().start(|context| async move {
             let mut harness = deploy(&context).await;
 
@@ -942,7 +1005,7 @@ mod tests {
     }
 
     #[test]
-    fn p4_verify_missing_payload_stays_pending_then_true() {
+    fn verify_missing_payload_stays_pending_then_true() {
         runner().start(|context| async move {
             let mut harness = deploy(&context).await;
             let carried = cert(&harness, 7, ANCESTOR - 1);
@@ -977,7 +1040,7 @@ mod tests {
     }
 
     #[test]
-    fn p4_verify_rejects_dup_in_ancestry() {
+    fn verify_rejects_dup_in_ancestry() {
         runner().start(|context| async move {
             let mut harness = deploy(&context).await;
             let carried = cert(&harness, 11, ANCESTOR - 1);
@@ -994,7 +1057,7 @@ mod tests {
     }
 
     #[test]
-    fn p6_dup_cert_in_later_block_rejected() {
+    fn dup_cert_in_later_block_rejected() {
         runner().start(|context| async move {
             let mut harness = deploy(&context).await;
 
@@ -1048,7 +1111,7 @@ mod tests {
     }
 
     #[test]
-    fn p6_verify_rejects_mismatched_coding_config() {
+    fn verify_rejects_mismatched_coding_config() {
         runner().start(|context| async move {
             let mut harness = deploy(&context).await;
             let view = ANCESTOR;
@@ -1102,7 +1165,7 @@ mod tests {
     }
 
     #[test]
-    fn p4_verify_rejects_same_cert_two_forks_dedup_per_fork() {
+    fn verify_rejects_same_cert_two_forks_dedup_per_fork() {
         runner().start(|context| async move {
             let mut harness = deploy(&context).await;
             let carried = cert(&harness, 13, ANCESTOR - 1);
@@ -1124,7 +1187,7 @@ mod tests {
     }
 
     #[test]
-    fn p4_verify_rejects_stale_and_future_dispersal() {
+    fn verify_rejects_stale_and_future_dispersal() {
         runner().start(|context| async move {
             let mut harness = deploy(&context).await;
             let view = ANCESTOR + 1;
@@ -1161,7 +1224,7 @@ mod tests {
     }
 
     #[test]
-    fn p4_verify_rejects_wrong_parent_binding() {
+    fn verify_rejects_wrong_parent_binding() {
         runner().start(|context| async move {
             let mut harness = deploy(&context).await;
 
@@ -1193,7 +1256,7 @@ mod tests {
     }
 
     #[test]
-    fn p4_reporter_advances_floors_and_evicts_pool() {
+    fn reporter_advances_floors_and_evicts_pool() {
         runner().start(|context| async move {
             // Custody is seeded before the node opens it, so the attestor replays two shards: one
             // old enough to expire at the view this test finalizes, and one that is not.

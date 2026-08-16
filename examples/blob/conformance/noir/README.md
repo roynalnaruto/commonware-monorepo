@@ -5,7 +5,7 @@
 `Poseidon2Hasher::finish_ref` semantics (capacity slot `len << 64`, rate-3 absorb, trailing
 permutation) on top of the public `std::hash::poseidon2_permutation`, which is the only Poseidon2
 entry point the Noir standard library still exports, and asserts every vector the Rust
-conformance test `p1_poseidon2_noir_vectors` embeds.
+conformance test `poseidon2::permutation::tests::noir_vectors` embeds.
 
 This is not a cargo target and nothing in the Rust build depends on it. It is run by hand when the
 sponge, the round constants, or the pinned Noir version change:

@@ -206,6 +206,7 @@ impl<E: BufferPooler + Metrics + Storage> PayloadStore<E> {
     ///
     /// Unlike [`PayloadStore::included`] this is not bounded by the freshness horizon: it walks as
     /// far as the store still holds, which is as far as the last [`PayloadStore::prune`] left.
+    #[cfg(test)]
     pub fn ancestry(&self, tip: &sha256::Digest) -> Vec<Arc<Payload>> {
         let mut chain = Vec::new();
         let mut cursor = self.nodes.get(tip);
@@ -247,7 +248,7 @@ mod tests {
     use std::time::Duration;
 
     /// Partition prefix shared by every store in these tests.
-    const PREFIX: &str = "p4";
+    const PREFIX: &str = "payload";
 
     fn runner() -> deterministic::Runner {
         deterministic::Runner::timed(Duration::from_secs(30))
@@ -266,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn p4_payload_roundtrip_and_rebuild() {
+    fn roundtrip_and_rebuild() {
         let runner = runner();
         let (expected, checkpoint) = runner.start_and_recover(|context| async move {
             let mut store =
@@ -330,7 +331,7 @@ mod tests {
     }
 
     #[test]
-    fn p4_payload_prune_respects_freshness_horizon() {
+    fn prune_respects_freshness_horizon() {
         runner().start(|context| async move {
             let mut store =
                 PayloadStore::init(context.child("store"), PREFIX, PARTICIPANTS as usize)

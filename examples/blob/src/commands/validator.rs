@@ -3,7 +3,7 @@
 //! # Two tiers of peer
 //!
 //! Validators are primary peers of one another: they dial each other, gossip addresses to each
-//! other, and drive the chain. Clients are secondary — tracked by identity so an authenticated
+//! other, and drive the chain. Clients are secondary -- tracked by identity so an authenticated
 //! network will talk to them at all, but never dialed, because a client is the party that shows
 //! up. That is why `--clients` is required rather than optional: there is no open ingress to a
 //! validator, so a client nobody was told about cannot connect.
@@ -188,7 +188,7 @@ impl Args {
 /// There is no graceful-shutdown signal to wait on: the runtime exposes no handler for one, so a
 /// validator runs until it is killed. Nothing is lost by that. Every store this node writes is
 /// crash-durable and replays what was durable when it reopens, which is the same thing a restart
-/// after a crash finds and is what `p6_restart_rebuilds_dedup_and_custody` exercises. The one
+/// after a crash finds and is what `restart_rebuilds_dedup_and_custody` exercises. The one
 /// thing that does end the process is an actor stopping, which is never expected: it is reported
 /// rather than survived, because a node missing one of its actors is a node that answers some
 /// questions and silently ignores others.
@@ -341,7 +341,7 @@ mod tests {
     ];
 
     #[test]
-    fn p7_cli_parses_validator_args() {
+    fn parses_args() {
         assert_eq!(
             parse(VALID).expect("the arguments are well-formed"),
             Args {
@@ -372,7 +372,7 @@ mod tests {
     }
 
     #[test]
-    fn p7_cli_rejects_malformed_validator_args() {
+    fn rejects_malformed_args() {
         /// Replaces the value of `flag` in an otherwise valid command line.
         fn with(flag: &str, value: &'static str) -> Vec<&'static str> {
             let mut args = VALID.to_vec();
@@ -438,7 +438,7 @@ mod tests {
     }
 
     #[test]
-    fn p7_cli_requires_validator_args() {
+    fn requires_args() {
         // Every flag but `--bootstrappers` is required, and the parser is what enforces it.
         for missing in ["--me", "--participants", "--clients", "--storage-dir"] {
             let position = VALID

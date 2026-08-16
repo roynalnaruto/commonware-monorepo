@@ -5,6 +5,16 @@
 //! old enough that a certificate dispersed in it can no longer be included and can no longer be
 //! within its retrievability window, every shard from that view is dead weight.
 //!
+//! # Expiry
+//!
+//! [`Custody::prune`] drops everything dispersed below `finalized - FRESHNESS - WINDOW`. The
+//! archive prunes whole sections of [`ITEMS_PER_SECTION`] views, so the floor is effectively
+//! rounded down: a shard outlives its horizon by up to a section rather than expiring inside it.
+//! The certificate registry rounds identically, so a certificate it still calls live is one whose
+//! shards are genuinely still held. Because the section is what actually changes, a floor that has
+//! not crossed a boundary returns without touching the archive, and pruning can be called on every
+//! finalization.
+//!
 //! # Ownership
 //!
 //! [`prunable::Archive`] is move-through: `put_multi` and `prune` consume the archive and return
@@ -168,6 +178,7 @@ impl<E: BufferPooler + Metrics + Storage> Custody<E> {
     ///
     /// `None` distinguishes a view that holds nothing, or was pruned, from a view that holds an
     /// empty list, which cannot happen.
+    #[cfg(test)]
     pub async fn get_all(&self, view: View) -> Result<Option<Vec<CustodyRecord>>, Error> {
         let archive = self.archive.as_ref().ok_or(Error::Poisoned)?;
         Ok(archive.get_all(view.get()).await?)
@@ -205,10 +216,10 @@ mod tests {
     use std::time::Duration;
 
     /// Partition prefix shared by every store in these tests.
-    const PREFIX: &str = "p2";
+    const PREFIX: &str = "custody";
 
     #[test]
-    fn p2_custody_put_get_roundtrip() {
+    fn put_get_roundtrip() {
         let runner = deterministic::Runner::timed(Duration::from_secs(30));
         runner.start(|context| async move {
             let (header, shards) = dispersal(7, 1);
@@ -237,7 +248,7 @@ mod tests {
     }
 
     #[test]
-    fn p2_custody_two_batches_same_view() {
+    fn two_batches_same_view() {
         let runner = deterministic::Runner::timed(Duration::from_secs(30));
         runner.start(|context| async move {
             // A gateway may seal more than one batch in a view, and so may two gateways.
@@ -282,7 +293,7 @@ mod tests {
     }
 
     #[test]
-    fn p2_custody_prune_drops_expired_keeps_live() {
+    fn prune_drops_expired_keeps_live() {
         let runner = deterministic::Runner::timed(Duration::from_secs(30));
         runner.start(|context| async move {
             let (expired, expired_shards) = dispersal(5, 5);
@@ -335,7 +346,7 @@ mod tests {
     }
 
     #[test]
-    fn p2_custody_restart_replays() {
+    fn restart_replays() {
         // Write in one run of the runtime, read in the next: the second run starts from the first
         // one's storage, so it sees exactly what a restarted validator would.
         let runner = deterministic::Runner::timed(Duration::from_secs(30));

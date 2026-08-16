@@ -29,11 +29,9 @@ use crate::{
     assignment::coding_config,
     attestor::{self, Attestor, Watermark},
     constants::{
-        ATTEST_SLACK, CERTIFICATION_TIMEOUT, CERTIFICATION_TIMEOUT_SIM, FETCH_TIMEOUT,
-        FETCH_TIMEOUT_SIM, LEADER_TIMEOUT, LEADER_TIMEOUT_SIM, MAX_TRACKED_BLOBS, PAYLOAD_DEQUE,
-        RETRIEVAL_TIMEOUT, RETRIEVAL_TIMEOUT_SIM, SHARD_FETCH_INITIAL, SHARD_FETCH_RETRY,
-        SHARD_FETCH_RETRY_SIM, SHARD_FETCH_TIMEOUT, SHARD_FETCH_TIMEOUT_SIM, SKIP_TIMEOUT,
-        SKIP_TIMEOUT_SIM, STATUS_TTL, TIMEOUT_RETRY, TIMEOUT_RETRY_SIM, VIEW_RETENTION,
+        ATTEST_SLACK, CERTIFICATION_TIMEOUT, FETCH_TIMEOUT, LEADER_TIMEOUT, MAX_TRACKED_BLOBS,
+        PAYLOAD_DEQUE, RETRIEVAL_TIMEOUT, SHARD_FETCH_INITIAL, SHARD_FETCH_RETRY,
+        SHARD_FETCH_TIMEOUT, SKIP_TIMEOUT, STATUS_TTL, TIMEOUT_RETRY, VIEW_RETENTION,
         consensus_namespace,
     },
     custody::{self, Custody},
@@ -159,7 +157,14 @@ impl Timing {
     }
 
     /// Timers for a simulated deployment, where nothing waits on a real network.
+    #[cfg(test)]
     pub const fn simulated(batch: Duration, disperse: Duration) -> Self {
+        use crate::constants::{
+            CERTIFICATION_TIMEOUT_SIM, FETCH_TIMEOUT_SIM, LEADER_TIMEOUT_SIM,
+            RETRIEVAL_TIMEOUT_SIM, SHARD_FETCH_RETRY_SIM, SHARD_FETCH_TIMEOUT_SIM,
+            SKIP_TIMEOUT_SIM, TIMEOUT_RETRY_SIM,
+        };
+
         Self {
             batch,
             disperse,
@@ -265,15 +270,15 @@ impl Handles {
 ///
 /// Holding one keeps the node alive: the actors run on their own tasks, and the handles here are
 /// what the outside world reaches them through.
-pub struct Node<E: Clock + Metrics + Spawner> {
+#[allow(
+    dead_code,
+    reason = "handles onto a running node, reached through by tests that drive one directly; the binary only runs it"
+)]
+pub struct Node {
     /// The tasks this node runs.
     ///
     /// Public so a caller can add its own before handing the group to [`Node::run`].
     pub handles: Handles,
-    /// Intake for blobs this node gateways.
-    pub batcher: batcher::Mailbox<E>,
-    /// Where every blob this node accepted has got to.
-    pub board: StatusBoard<E>,
     /// The consensus-facing application, and the certificate pool behind it.
     pub application: application::Mailbox,
     /// The attestor, which owns this node's custody.
@@ -291,7 +296,7 @@ pub struct Node<E: Clock + Metrics + Spawner> {
     _originator: collector::Mailbox<ed25519::PublicKey, DisperseRequest>,
 }
 
-impl<E: Clock + Metrics + Spawner> Node<E> {
+impl Node {
     /// Runs until one of the node's tasks stops, and aborts the rest.
     ///
     /// Consumes the node rather than borrowing it, because the mailboxes it holds are what keep
@@ -310,7 +315,7 @@ pub async fn start<E, B, P, S, R, T>(
     context: E,
     config: NodeConfig<B, P, T>,
     channels: Channels<S, R>,
-) -> Result<Node<E>, Error>
+) -> Result<Node, Error>
 where
     E: BufferPooler + Clock + CryptoRng + Metrics + Spawner + Storage,
     B: Blocker<PublicKey = ed25519::PublicKey>,
@@ -457,7 +462,6 @@ where
             attestor: attestor_mailbox.clone(),
             shard: config.shard,
             timeout: config.timing.retrieval,
-            mailbox_size: config.mailbox_size,
             strategy: config.strategy.clone(),
         },
         shard_inbox,
@@ -508,7 +512,7 @@ where
     let server = rpc::Server::new(
         context.child("rpc"),
         rpc::Config {
-            batcher: submit.clone(),
+            batcher: submit,
             board: board.clone(),
             registry: registry.clone(),
             retrieval: retrieval_mailbox.clone(),
@@ -549,8 +553,6 @@ where
 
     Ok(Node {
         handles,
-        batcher: submit,
-        board,
         application: mailbox,
         attestor: attestor_mailbox,
         registry,
@@ -649,7 +651,7 @@ mod tests {
     }
 
     /// Starts [`VALIDATORS`] full nodes over one simulated network.
-    async fn deploy(context: &deterministic::Context) -> (Vec<Node<deterministic::Context>>, Keys) {
+    async fn deploy(context: &deterministic::Context) -> (Vec<Node>, Keys) {
         let keys = test_util::keys(VALIDATORS);
         let peers: Vec<_> = keys
             .privates
@@ -669,7 +671,7 @@ mod tests {
                     bls: keys.bls[index].clone(),
                     participants: keys.participants.clone(),
                     namespace: NAMESPACE.to_vec(),
-                    partition: format!("p4-node-{index}"),
+                    partition: format!("consensus-node-{index}"),
                     blocker: oracle.control(peer.clone()),
                     peers: oracle.manager(),
                     mailbox_size: NZUsize!(256),
@@ -690,11 +692,7 @@ mod tests {
 
     /// Waits until every node has finalized at least `target`, which is also the liveness check:
     /// views only advance if empty payloads keep finalizing.
-    async fn advance(
-        context: &deterministic::Context,
-        nodes: &[Node<deterministic::Context>],
-        target: View,
-    ) {
+    async fn advance(context: &deterministic::Context, nodes: &[Node], target: View) {
         let deadline = context.current() + Duration::from_secs(120);
         while nodes.iter().any(|node| node.watermark.get() < target) {
             assert!(
@@ -725,10 +723,7 @@ mod tests {
     }
 
     /// Returns how many payloads of each node's finalized chain carry `commitment`.
-    async fn inclusions(
-        nodes: &[&Node<deterministic::Context>],
-        commitment: &Summary,
-    ) -> Vec<usize> {
+    async fn inclusions(nodes: &[&Node], commitment: &Summary) -> Vec<usize> {
         let mut counts = Vec::new();
         for node in nodes {
             let snapshot = node
@@ -746,7 +741,7 @@ mod tests {
     /// A restarted node opens the same partitions under a different metric label, which is the
     /// whole of what "same node, new process" means here.
     fn partition(index: usize) -> String {
-        format!("p6-node-{index}")
+        format!("node-{index}")
     }
 
     /// The validator that is stopped and restarted.
@@ -774,7 +769,7 @@ mod tests {
 
     /// A running validator, and the one handle that stops all of it.
     struct Running {
-        node: Node<deterministic::Context>,
+        node: Node,
         /// The task every actor of this node was spawned beneath. Aborting it aborts the subtree,
         /// which is every task the node owns.
         handle: Handle<()>,
@@ -873,7 +868,7 @@ mod tests {
     }
 
     #[test]
-    fn p6_restart_rebuilds_dedup_and_custody() {
+    fn restart_rebuilds_dedup_and_custody() {
         runner().start(|context| async move {
             let keys = test_util::keys(VALIDATORS);
             let attesting = test_util::attesting(&keys);
@@ -1143,8 +1138,126 @@ mod tests {
         });
     }
 
+    /// The validator that starts once the chain is already running.
+    ///
+    /// It opens an empty store, so nothing it is offered afterwards has a parent it can place: its
+    /// verifications stay pending, and every block it finalizes is one it never checked itself.
+    const LATE: usize = 4;
+
+    /// Views the late validator is given to recover the block carrying the certificate.
+    const RECOVERY_BUDGET: u64 = 30;
+
     #[test]
-    fn p4_e2e_cert_to_finalized_block() {
+    fn finalized_payload_recovered_from_gossip_cache() {
+        runner().start(|context| async move {
+            let keys = test_util::keys(VALIDATORS);
+            let attesting = test_util::attesting(&keys);
+            let peers: Vec<ed25519::PublicKey> = keys
+                .privates
+                .iter()
+                .map(|private| private.public_key())
+                .collect();
+            let oracle = test_util::network(&context, &peers).await;
+
+            // A batch this deployment really encoded, custodied by every validator that signs the
+            // certificate over it. Written before any node opens its store, which is the state a
+            // dispersal leaves behind.
+            let quorum = N3f1::quorum(VALIDATORS as u32) as usize;
+            let (header, shards) = test_util::dispersal_among(VALIDATORS, DISPERSED, 0xd1);
+            let commitment = header.commitment;
+            for (index, shard) in shards.iter().enumerate().take(quorum) {
+                let mut custody = Custody::init(
+                    context.child("seed"),
+                    &partition(index),
+                    test_util::shard_cfg(),
+                )
+                .await
+                .expect("custody opens");
+                custody
+                    .put(
+                        header.dispersal_view,
+                        commitment,
+                        CustodyRecord {
+                            index: index as u16,
+                            shard: shard.clone(),
+                        },
+                    )
+                    .await
+                    .expect("shard stores");
+            }
+
+            // Everyone but one, running until the chain has left genesis behind. Four of five is
+            // a quorum, so the fifth is not needed for progress.
+            let mut nodes = Vec::new();
+            for index in 0..VALIDATORS {
+                if index == LATE {
+                    continue;
+                }
+                nodes.push(spawn_node(&context, "validator", index, &keys, &oracle).await);
+            }
+            reach(&context, &nodes.iter().collect::<Vec<_>>(), View::new(2)).await;
+
+            // The straggler joins. It receives every payload the gossip layer carries and hears
+            // every finalization, and it can verify none of them: the parent of anything it is
+            // offered is a block it was not there for.
+            let late = spawn_node(&context, "late", LATE, &keys, &oracle).await;
+
+            // A certificate a quorum of these validators really attested to, offered to one node
+            // that was already running -- never to the straggler, whose pool never holds it.
+            let cert = test_util::genuine_cert(
+                &attesting,
+                &header,
+                &keys.privates[0],
+                Fr::from(21u64),
+                quorum,
+            );
+            const { assert!(INJECTED < LATE, "the injected validator is a running one") };
+            assert!(nodes[INJECTED].node.application.certificate(cert));
+
+            // It rides into a block, and the straggler learns of it from that block alone.
+            let deadline = View::new(DISPERSED + RECOVERY_BUDGET);
+            let (registered, included) = loop {
+                if let Some(found) = late.node.registry.get(&commitment) {
+                    break found;
+                }
+                assert!(
+                    late.node.watermark.get() < deadline,
+                    "the certificate never reached the straggler's registry"
+                );
+                context.sleep(Duration::from_millis(50)).await;
+            };
+            assert_eq!(registered.header, header);
+            assert!(included <= late.node.watermark.get());
+
+            // The payload behind it is stored rather than merely read out of the gossip cache, so
+            // the block is on this node's chain like any other.
+            assert_eq!(
+                inclusions(&[&late.node], &commitment).await,
+                vec![1],
+                "the recovered block is not on the straggler's chain"
+            );
+
+            // And the read path is open on it. The straggler custodies no shard of this batch, so
+            // every shard it decodes was gathered from the custodians the recovered certificate
+            // names -- which is the whole point of recording it.
+            assert!(
+                late.node.attestor.fetch(commitment).await.is_none(),
+                "the straggler custodied a shard of its own"
+            );
+            let (batch, returned) = late
+                .node
+                .retrieval
+                .fetch(commitment)
+                .await
+                .expect("coordinator answers")
+                .expect("batch is retrieved");
+            assert_eq!(batch, test_util::sample_batch(0xd1));
+            assert_eq!(returned.header, header);
+        });
+    }
+
+    #[test]
+    fn e2e_cert_to_finalized_block() {
         runner().start(|context| async move {
             let (nodes, keys) = deploy(&context).await;
 
@@ -1287,7 +1400,7 @@ mod tests {
     }
 
     #[test]
-    fn p7_node_handles_stop_together() {
+    fn handles_stop_together() {
         runner().start(|context| async move {
             // What a node's task group promises the binary: it resolves when the first task
             // stops, and every other task is stopped with it. A validator missing one actor is

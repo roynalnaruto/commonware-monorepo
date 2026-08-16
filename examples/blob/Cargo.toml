@@ -5,6 +5,7 @@ publish = false
 version.workspace = true
 license.workspace = true
 description = "Post blobs to a ZODA-backed data-availability rail alongside a consensus chain."
+readme = "README.md"
 homepage.workspace = true
 repository = "https://github.com/commonwarexyz/monorepo/tree/main/examples/blob"
 

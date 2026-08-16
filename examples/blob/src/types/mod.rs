@@ -22,13 +22,10 @@ mod header;
 #[cfg(test)]
 mod test_util;
 
-// The vocabulary is defined ahead of the actors that consume it, so some of these names have no
-// caller inside this binary yet.
-#[allow(unused_imports)]
 pub use self::{
     batch::{Batch, BatchBuilder, Sealed},
     blob::{Blob, BlobId},
     cert::{ClaimedRoot, DaCert},
     error::Error,
-    header::{Attestation, BatchHeader, Certificate, Namespace, Scheme, scheme},
+    header::{Attestation, BatchHeader, Certificate, Scheme},
 };
