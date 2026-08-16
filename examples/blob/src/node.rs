@@ -67,10 +67,12 @@ use commonware_cryptography::{
 use commonware_p2p::{Blocker, Provider, Receiver, Sender};
 use commonware_parallel::Strategy;
 use commonware_resolver::p2p as resolver;
-use commonware_runtime::{BufferPooler, Clock, Metrics, Spawner, Storage, buffer::paged::CacheRef};
+use commonware_runtime::{
+    BufferPooler, Clock, Handle, Metrics, Spawner, Storage, buffer::paged::CacheRef,
+};
 use commonware_utils::{NZU16, NZUsize, channel::mpsc, ordered::BiMap};
 use rand_core::CryptoRng;
-use std::{num::NonZeroUsize, time::Duration};
+use std::{future::Future, num::NonZeroUsize, time::Duration};
 
 /// Sealed batches queued for dispersal before intake is held.
 ///
@@ -226,11 +228,48 @@ pub struct Channels<S, R> {
     pub client_rpc: (S, R),
 }
 
+/// The tasks a node runs, as a group that lives and dies together.
+///
+/// A validator is only a validator with all of its actors: one that lost its attestor still votes
+/// and still answers clients, and quietly stops custodying anything. So the group has one
+/// lifetime, and the first task to stop ends it.
+///
+/// The group is what a caller waits on, not what it stops with. Aborting these handles would
+/// leave the tasks an actor spawns from a context of its own -- a producer serving one shard
+/// request, a batch being encoded -- running under a node that is otherwise gone. What stops a
+/// node is dropping the task it was started beneath, which takes its whole subtree with it; that
+/// is how the restart test stops one, and how a process exit stops one.
+#[derive(Default)]
+pub struct Handles(Vec<Handle<()>>);
+
+impl Handles {
+    /// Adds a task to the group.
+    ///
+    /// Public because the group is not only what a node started: the network it speaks over is
+    /// started by whoever configured it, and a node without that is as much use as a node without
+    /// an attestor.
+    pub fn push(&mut self, handle: Handle<()>) {
+        self.0.push(handle);
+    }
+
+    /// Waits until the first task stops, then aborts the rest.
+    ///
+    /// Returns what that task returned, which for a node that is running correctly is never:
+    /// every actor here loops until its context is torn down.
+    pub fn wait(self) -> impl Future<Output = Result<(), commonware_runtime::Error>> + Send {
+        Handle::select(self.0)
+    }
+}
+
 /// A running validator.
 ///
 /// Holding one keeps the node alive: the actors run on their own tasks, and the handles here are
 /// what the outside world reaches them through.
 pub struct Node<E: Clock + Metrics + Spawner> {
+    /// The tasks this node runs.
+    ///
+    /// Public so a caller can add its own before handing the group to [`Node::run`].
+    pub handles: Handles,
     /// Intake for blobs this node gateways.
     pub batcher: batcher::Mailbox<E>,
     /// Where every blob this node accepted has got to.
@@ -250,6 +289,20 @@ pub struct Node<E: Clock + Metrics + Spawner> {
     /// Kept for its lifetime rather than its interface: the engine polls its mailbox and spins on
     /// a closed one, so dropping the last handle would starve every other task on the runtime.
     _originator: collector::Mailbox<ed25519::PublicKey, DisperseRequest>,
+}
+
+impl<E: Clock + Metrics + Spawner> Node<E> {
+    /// Runs until one of the node's tasks stops, and aborts the rest.
+    ///
+    /// Consumes the node rather than borrowing it, because the mailboxes it holds are what keep
+    /// the actors behind them alive: the dispersal engine spins on a mailbox whose last handle has
+    /// been dropped, and would starve everything else on the runtime.
+    pub async fn run(mut self) -> Result<(), commonware_runtime::Error> {
+        let handles = std::mem::take(&mut self.handles);
+        let outcome = handles.wait().await;
+        drop(self);
+        outcome
+    }
 }
 
 /// Starts every actor a validator runs and returns the handles onto them.
@@ -312,7 +365,8 @@ where
         },
         custody,
     )?;
-    attestor.start();
+    let mut handles = Handles::default();
+    handles.push(attestor.start());
 
     // Dispersal: the engine needs the disperser's monitor before it yields the originator the
     // disperser sends through, so the mailbox is built ahead of both.
@@ -331,7 +385,7 @@ where
             response_codec: (),
         },
     );
-    dispersal.start(channels.disperse_req, channels.disperse_res);
+    handles.push(dispersal.start(channels.disperse_req, channels.disperse_res));
 
     // Payload dissemination, and the store that makes a payload answerable for after a restart.
     let (payload_gossip, payloads) = buffered::Engine::new(
@@ -345,7 +399,7 @@ where
             peer_provider: config.peers.clone(),
         },
     );
-    payload_gossip.start(channels.payload_gossip);
+    handles.push(payload_gossip.start(channels.payload_gossip));
     let store = PayloadStore::init(
         context.child("payload_store"),
         &config.partition,
@@ -369,7 +423,7 @@ where
             strategy: config.strategy.clone(),
         },
     );
-    application.start(channels.cert_gossip);
+    handles.push(application.start(channels.cert_gossip));
 
     // The read path. Its engine needs the consumer that feeds the coordinator before it yields
     // the handle the coordinator fetches through, so the mailbox is built ahead of both, exactly
@@ -393,8 +447,8 @@ where
             priority_responses: false,
         },
     );
-    shards.start(channels.retrieval);
-    Coordinator::new(
+    handles.push(shards.start(channels.retrieval));
+    let coordinator = Coordinator::new(
         context.child("retrieval"),
         retrieval::Config {
             scheme: attesting.clone(),
@@ -408,8 +462,8 @@ where
         },
         shard_inbox,
         resolver_mailbox,
-    )
-    .start();
+    );
+    handles.push(coordinator.start());
 
     // The gateway: intake feeds dispersal over a bounded queue, and dispersal hands what it
     // certifies to the application, which pools it and puts it on the wire.
@@ -426,8 +480,8 @@ where
         },
         sealed,
     );
-    batcher.start();
-    Disperser::new(
+    handles.push(batcher.start());
+    let disperser = Disperser::new(
         context.child("disperser"),
         disperser::Config {
             scheme: attesting,
@@ -446,12 +500,12 @@ where
         },
         inbox,
         batches,
-    )
-    .start();
+    );
+    handles.push(disperser.start());
 
     // What clients talk to. Nothing behind it is trusted by them: an acknowledgement names a
     // blob they can rehash, and a batch comes with the certificate they check it against.
-    rpc::Server::new(
+    let server = rpc::Server::new(
         context.child("rpc"),
         rpc::Config {
             batcher: submit.clone(),
@@ -459,8 +513,8 @@ where
             registry: registry.clone(),
             retrieval: retrieval_mailbox.clone(),
         },
-    )
-    .start(channels.client_rpc);
+    );
+    handles.push(server.start(channels.client_rpc));
 
     // Consensus. The floor is the genesis payload's digest: every ancestry walk ends there, so
     // every chain starts there.
@@ -491,9 +545,10 @@ where
             track_historical_votes: false,
         },
     );
-    engine.start(channels.votes, channels.certificates, channels.resolver);
+    handles.push(engine.start(channels.votes, channels.certificates, channels.resolver));
 
     Ok(Node {
+        handles,
         batcher: submit,
         board,
         application: mailbox,
@@ -537,6 +592,10 @@ mod tests {
     use commonware_parallel::Sequential;
     use commonware_runtime::{Handle, Runner, Supervisor as _, deterministic};
     use commonware_utils::{Faults as _, N3f1, NZUsize, channel::oneshot};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     /// Validators in the consensus deployment: `n = 5`, `f = 1`, quorum 4, minimum shards 2.
     ///
@@ -1225,5 +1284,47 @@ mod tests {
                 assert_eq!(node.watermark.get(), snapshot.finalized);
             }
         });
+    }
+
+    #[test]
+    fn p7_node_handles_stop_together() {
+        runner().start(|context| async move {
+            // What a node's task group promises the binary: it resolves when the first task
+            // stops, and every other task is stopped with it. A validator missing one actor is
+            // not a validator running with fewer, so the process ends rather than carries on.
+            let stopped = Arc::new(AtomicUsize::new(0));
+            let mut handles = Handles::default();
+            for _ in 0..3 {
+                let stopped = stopped.clone();
+                handles.push(context.child("forever").spawn(move |_| async move {
+                    let _guard = Counter(stopped);
+                    std::future::pending::<()>().await
+                }));
+            }
+            handles.push(context.child("returns").spawn(|_| async {}));
+
+            assert!(handles.wait().await.is_ok());
+
+            // Aborting is a request the runtime delivers the next time it polls each task, so
+            // the group's tasks are gone once the runtime has run again rather than the instant
+            // the wait returns.
+            let deadline = context.current() + Duration::from_secs(10);
+            while stopped.load(Ordering::Relaxed) < 3 {
+                assert!(
+                    context.current() < deadline,
+                    "a task outlived the group it belongs to"
+                );
+                context.sleep(Duration::from_millis(1)).await;
+            }
+        });
+    }
+
+    /// Counts the tasks that were stopped rather than allowed to run on.
+    struct Counter(Arc<AtomicUsize>);
+
+    impl Drop for Counter {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }

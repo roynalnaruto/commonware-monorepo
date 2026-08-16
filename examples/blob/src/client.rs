@@ -36,6 +36,7 @@ use crate::{
     types::{self, Blob, BlobId, Scheme},
     wire::{BatchResult, BlobStatus, ClientRequest, ClientResponse, Coder},
 };
+use bytes::Bytes;
 use commonware_codec::{Encode as _, Error as CodecError};
 use commonware_coding::PhasedScheme;
 use commonware_cryptography::{
@@ -53,8 +54,20 @@ use commonware_parallel::Strategy;
 use commonware_runtime::{BufferPooler, Clock, Metrics, Spawner};
 use commonware_utils::ordered::BiMap;
 use rand_core::CryptoRng;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tracing::warn;
+
+/// Bytes of the blob a liveness probe asks about.
+///
+/// Never submitted anywhere: what makes it a probe is that no gateway can have a record of it, so
+/// the only thing its answer reports is that an answer arrived.
+const PROBE: &[u8] = b"_COMMONWARE_EXAMPLES_BLOB_PROBE";
+
+/// How long one liveness probe waits before it is sent again.
+///
+/// Short, because what it waits for is a connection being established rather than work being
+/// done: a peer that is already connected answers a status poll immediately.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Why a client could not get what it asked for.
 #[derive(Debug, thiserror::Error)]
@@ -335,6 +348,81 @@ where
             .ok_or(Error::Missing)
     }
 
+    /// Waits until `peer` answers anything, or `deadline` passes.
+    ///
+    /// A client dials in rather than being dialed, so its first request races the connection it
+    /// has to travel over, and a send to a peer that is not connected yet is simply dropped. The
+    /// probe is a status poll about a blob nobody submitted: it has no side effects anywhere, and
+    /// the answer is proof that the link is up rather than proof of anything about a blob.
+    ///
+    /// A probe that times out may still be answered afterwards, and because requests carry no
+    /// correlation identifier (see the module documentation) that answer is readable by the next
+    /// status poll. It says `None`, which every caller here reads as "not yet", so a late probe
+    /// costs a poll rather than a wrong verdict.
+    pub async fn connect(
+        &mut self,
+        peer: &ed25519::PublicKey,
+        deadline: SystemTime,
+    ) -> Result<(), Error> {
+        let probe = Blob::new(Bytes::from_static(PROBE))
+            .expect("the probe is within the blob size bounds")
+            .id();
+        loop {
+            let outcome = self
+                .exchange_within(
+                    peer,
+                    ClientRequest::Status(probe),
+                    Tag::Status,
+                    PROBE_TIMEOUT,
+                )
+                .await;
+            match outcome {
+                Ok(_) => return Ok(()),
+                Err(Error::Timeout | Error::Unreachable) => {}
+                Err(err) => return Err(err),
+            }
+            if self.context.current() >= deadline {
+                return Err(Error::Timeout);
+            }
+        }
+    }
+
+    /// Polls `gateway` until `id` settles, or `deadline` passes.
+    ///
+    /// A blob settles when it is included in a finalized block or when the gateway gives up on
+    /// it; everything before that is a stage it is passing through. `observed` is called once for
+    /// each status the poll sees change, which is what lets a caller narrate the lifecycle rather
+    /// than only report its end.
+    ///
+    /// A status is a gateway's own bookkeeping and never a proof of anything. What it is for is
+    /// deciding when it is worth asking for something checkable, which is
+    /// [`Client::fetch_verified`].
+    pub async fn poll_status(
+        &mut self,
+        gateway: &ed25519::PublicKey,
+        id: BlobId,
+        deadline: SystemTime,
+        interval: Duration,
+        mut observed: impl FnMut(&BlobStatus) + Send,
+    ) -> Result<BlobStatus, Error> {
+        let mut last = None;
+        loop {
+            if let Some(status) = self.status(gateway, id).await?
+                && last.as_ref() != Some(&status)
+            {
+                observed(&status);
+                if matches!(status, BlobStatus::Included { .. } | BlobStatus::Failed) {
+                    return Ok(status);
+                }
+                last = Some(status);
+            }
+            if self.context.current() >= deadline {
+                return Err(Error::Timeout);
+            }
+            self.context.sleep(interval).await;
+        }
+    }
+
     /// Computes a blob's identity off the caller's task.
     async fn identify(&self, blob: Blob) -> Result<BlobId, Error> {
         self.context
@@ -396,6 +484,21 @@ where
         request: ClientRequest,
         want: Tag,
     ) -> Result<ClientResponse, Error> {
+        self.exchange_within(peer, request, want, self.timeout)
+            .await
+    }
+
+    /// Sends one request and waits `timeout` for the reply that answers it.
+    ///
+    /// The wait is a parameter because the requests do not cost the same: a status is a map
+    /// lookup, and a batch query holds a whole gather open behind it.
+    async fn exchange_within(
+        &mut self,
+        peer: &ed25519::PublicKey,
+        request: ClientRequest,
+        want: Tag,
+        timeout: Duration,
+    ) -> Result<ClientResponse, Error> {
         if self
             .sender
             .send(Recipients::One(peer.clone()), request, false)
@@ -403,7 +506,7 @@ where
         {
             return Err(Error::Unreachable);
         }
-        let deadline = self.context.current() + self.timeout;
+        let deadline = self.context.current() + timeout;
         loop {
             let received = select! {
                 _ = self.context.sleep_until(deadline) => return Err(Error::Timeout),

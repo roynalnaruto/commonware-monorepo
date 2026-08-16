@@ -7,8 +7,12 @@
 //! below the wire bounds.
 
 use commonware_consensus::types::ViewDelta;
-use commonware_utils::{NZU64, union};
-use std::{num::NonZeroU64, time::Duration};
+use commonware_runtime::Quota;
+use commonware_utils::{NZU32, NZU64, NZUsize, union};
+use std::{
+    num::{NonZeroU64, NonZeroUsize},
+    time::Duration,
+};
 
 /// Globally unique namespace for every signature this example produces.
 ///
@@ -90,6 +94,54 @@ pub const RETRIEVAL_CHANNEL: u64 = 8;
 
 /// Client submissions, status polls, and batch queries, in both directions.
 pub const CLIENT_RPC_CHANNEL: u64 = 9;
+
+/// Messages per second a peer may send on a consensus channel.
+///
+/// Votes, certificates, and resolution requests are all small and all frequent: a view produces
+/// several of each, and a node that is behind produces more. Generous, because dropping one costs
+/// a view, and cheap, because none of these messages is large.
+pub const CONSENSUS_RATE: Quota = Quota::per_second(NZU32!(128));
+
+/// Messages per second a peer may send on the dispersal-request channel.
+///
+/// The one channel that carries megabytes: a strong shard of an 8 MiB batch measured 4.10 MiB at
+/// the four-validator deployment. A gateway seals at most one batch per [`BATCH_TIMEOUT`], so two
+/// dispersals a second is the honest cadence and this is the headroom over it. Keeping the rate
+/// low is what keeps the channel's inbound mailbox, which is sized as the rate's burst times the
+/// retained peer count, from being a memory bound rather than a rate bound.
+pub const DISPERSE_REQ_RATE: Quota = Quota::per_second(NZU32!(8));
+
+/// Messages per second a peer may send on the attestation channel.
+///
+/// One attestation per dispersal, and an attestation is a signature: small enough that the rate
+/// is set by how many gateways may be dispersing at once rather than by size.
+pub const DISPERSE_RES_RATE: Quota = Quota::per_second(NZU32!(32));
+
+/// Messages per second a peer may send on either gossip channel.
+///
+/// Certificates and payloads are both bounded by their wire caps and both arrive at the rate the
+/// chain makes progress, which is views per second rather than batches per second.
+pub const GOSSIP_RATE: Quota = Quota::per_second(NZU32!(64));
+
+/// Messages per second a peer may send on the retrieval channel.
+///
+/// Requests and shards share it, so the rate has to cover a whole gather: one request per
+/// certificate signer, each of which may be retried, and one shard back per custodian.
+pub const RETRIEVAL_RATE: Quota = Quota::per_second(NZU32!(32));
+
+/// Messages per second a client may send a validator, and a validator a client.
+///
+/// A client polls a status a few times a second and otherwise sends one request at a time, and a
+/// batch travels back in a single message. Bounded tightly because a client is the one peer on
+/// the network that nobody vouched for.
+pub const CLIENT_RPC_RATE: Quota = Quota::per_second(NZU32!(16));
+
+/// Threads a node encodes, decodes, and verifies signatures on.
+///
+/// Sealing an 8 MiB batch serially measured 794 ms against a 500 ms timer, and in parallel
+/// 123 ms: the batch cadence is only met with more than one thread. Four rather than the whole
+/// machine because a local deployment runs several validators on one host.
+pub const CODING_PARALLELISM: NonZeroUsize = NZUsize!(4);
 
 /// Bytes per page of a blob, the unit of the page tree and of an in-circuit opening.
 pub const BLOB_PAGE: usize = 4096;
@@ -366,6 +418,11 @@ mod tests {
             assert!(MAX_CONCURRENT_SHARD_SERVES > 0);
             assert!(MAX_CONCURRENT_CLIENT_REQUESTS > 0);
         }
+
+        // The channel that carries shards is rate limited well below the ones that carry
+        // signatures: a burst on it is measured in megabytes rather than in bytes.
+        assert!(DISPERSE_REQ_RATE.burst_size() < DISPERSE_RES_RATE.burst_size());
+        assert!(DISPERSE_REQ_RATE.burst_size() < CONSENSUS_RATE.burst_size());
     }
 
     #[test]

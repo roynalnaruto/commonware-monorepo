@@ -41,7 +41,7 @@ use std::{
     num::NonZeroUsize,
     sync::Arc,
 };
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 /// Certificates that have been gossiped but not yet included on the finalized chain.
 ///
@@ -409,6 +409,11 @@ impl<E: BufferPooler + Clock + CryptoRng + Metrics + Spawner + Storage, T: Strat
                 self.finalized = view;
                 self.tip = payload;
                 self.watermark.set(view);
+                info!(
+                    view = view.get(),
+                    certs = self.store.get(&payload).map_or(0, |held| held.certs.len()),
+                    "finalized"
+                );
 
                 // A certificate on the finalized chain is spent for consensus and born for
                 // retrieval: it can never be included again, the blobs behind it have reached the
